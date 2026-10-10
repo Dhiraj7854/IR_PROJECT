@@ -1,0 +1,24 @@
+# Two-Stage Neural Ranking System Configuration
+
+dataset:
+  name: "msmarco-passage"
+  corpus_subset_size: 100000
+  query_splits:
+    train: 3500
+    val: 750
+    test: 750
+
+models:
+  biencoder_name: "sentence-transformers/all-MiniLM-L6-v2"
+  crossencoder_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  max_seq_len: 256
+
+training:
+  batch_size: 32
+  lr: 0.00002
+  epochs: 3
+
+retrieval:
+  stage1_top_k: 100
+  rerank_depth: 50
+
