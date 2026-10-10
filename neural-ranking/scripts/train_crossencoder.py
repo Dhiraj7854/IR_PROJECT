@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -262,6 +261,8 @@ def evaluate_val_mrr(
 
 def main() -> None:
     args = parse_args()
+    from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
     if (
         args.batch_size <= 0
         or args.lr <= 0

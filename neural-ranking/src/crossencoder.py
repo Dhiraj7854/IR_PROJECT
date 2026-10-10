@@ -10,7 +10,6 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,11 @@ class CrossEncoderRanker(nn.Module):
         super().__init__()
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in the range [0, 1)")
-        self.backbone = backbone or AutoModel.from_pretrained(str(model_name_or_path))
+        if backbone is None:
+            from transformers import AutoModel
+
+            backbone = AutoModel.from_pretrained(str(model_name_or_path))
+        self.backbone = backbone
         hidden_size = int(self.backbone.config.hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.scoring_head = nn.Linear(hidden_size, 1)
@@ -109,6 +112,8 @@ def load_crossencoder(
     _RANKER = CrossEncoderRanker.from_pretrained(model_path)
     _RANKER.to(target_device)
     _RANKER.eval()
+    from transformers import AutoTokenizer
+
     _TOKENIZER = AutoTokenizer.from_pretrained(str(model_path))
     return _RANKER, _TOKENIZER
 

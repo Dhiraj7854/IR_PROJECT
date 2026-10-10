@@ -1,52 +1,85 @@
-"""Placeholder script for evaluating retrieval and ranking runs with pytrec_eval."""
+#!/usr/bin/env python3
+"""Evaluate one TREC run using the project's standard retrieval metrics."""
+
+from __future__ import annotations
 
 import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Dict
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.evaluate import average_metrics, evaluate_run, load_qrels
+
+_METRIC_ALIASES = {
+    "mrr@10": "MRR@10",
+    "recip_rank": "MRR@10",
+    "ndcg@10": "NDCG@10",
+    "ndcg_cut_10": "NDCG@10",
+    "p@5": "P@5",
+    "precision_5": "P@5",
+    "recall@100": "Recall@100",
+    "recall_100": "Recall@100",
+}
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments for ranking evaluation."""
+    """Parse TREC run, qrels, metric selection, and output paths."""
     parser = argparse.ArgumentParser(
-        description="Compute ranking metrics (MRR@10, NDCG@10, MAP, Recall) for a run file."
+        description="Compute per-query and macro retrieval metrics for a TREC run."
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/config.yaml",
-        help="Path to YAML configuration file.",
-    )
-    parser.add_argument(
+        "--run-file",
         "--run_file",
-        type=str,
         required=True,
-        help="Path to TREC run file or TSV ranking file.",
+        help="Path to a six-column TREC run file.",
     )
     parser.add_argument(
+        "--qrels-file",
         "--qrels_file",
-        type=str,
         required=True,
-        help="Path to ground truth relevance judgments file (qrels).",
+        help="Path to parquet or four-column TREC qrels.",
     )
     parser.add_argument(
         "--metrics",
         nargs="+",
-        default=["recip_rank", "ndcg_cut_10", "recall_100", "map"],
-        help="List of evaluation metrics to compute.",
+        choices=sorted(_METRIC_ALIASES),
+        default=["mrr@10", "ndcg@10", "p@5", "recall@100"],
+        help="Metrics to include (accepted aliases map to the project's fixed cutoffs).",
     )
     parser.add_argument(
+        "--output-file",
         "--output_file",
-        type=str,
         default="artifacts/eval_results.json",
-        help="Path to save evaluation summary metrics.",
+        help="JSON output path.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Entry point for ranking evaluation script."""
+    """Evaluate the run and write per-query and average JSON results."""
     args = parse_args()
-    pass
+    per_query = evaluate_run(load_qrels(args.qrels_file), args.run_file)
+    averages = average_metrics(per_query)
+    metric_names = list(dict.fromkeys(_METRIC_ALIASES[name] for name in args.metrics))
+    result: Dict[str, object] = {
+        "metrics": metric_names,
+        "per_query": {
+            qid: {metric: scores[metric] for metric in metric_names}
+            for qid, scores in per_query.items()
+        },
+        "average": {metric: averages[metric] for metric in metric_names},
+    }
+    output_path = Path(args.output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result["average"], indent=2))
+    print(f"Wrote per-query and average metrics to {output_path}")
 
 
 if __name__ == "__main__":
     main()
-

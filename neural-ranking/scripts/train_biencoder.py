@@ -16,14 +16,11 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sentence_transformers import InputExample, SentenceTransformer
-from sentence_transformers import losses as st_losses
 from src.config import load_config
 from src.biencoder import DEFAULT_MODEL_NAME
 from src.experiments import sample_random_negative_texts
@@ -176,7 +173,9 @@ def _create_training_examples(
     negatives: str = "hard",
     corpus_df: pd.DataFrame | None = None,
     seed: int = 42,
-) -> List[InputExample]:
+) -> List[Any]:
+    from sentence_transformers import InputExample
+
     required = {"query_text", "pos_text", "neg_text"}
     missing = required.difference(triplets.columns)
     if missing:
@@ -228,6 +227,10 @@ def _create_training_examples(
 
 def main() -> None:
     args = parse_args()
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import losses as st_losses
+    from transformers import get_linear_schedule_with_warmup
+
     config = load_config(args.config)
     batch_size = (
         config.training.batch_size
