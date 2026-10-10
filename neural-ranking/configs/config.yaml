@@ -14,11 +14,13 @@ models:
   max_seq_len: 256
 
 training:
-  batch_size: 32
+  batch_size: 64
   lr: 0.00002
-  epochs: 3
+  epochs: 2
+  fp16: true
+  warmup_ratio: 0.1
+  early_stopping_patience: 1
 
 retrieval:
   stage1_top_k: 100
   rerank_depth: 50
-
