@@ -37,12 +37,12 @@ EMBEDDINGS_PATH = BIENCODER_PATH / "corpus_embeddings.npy"
 CONFIG = load_config(PROJECT_ROOT / "configs" / "config.yaml")
 MAX_SEQ_LEN = CONFIG.models.max_seq_len
 
-# Representative examples from the test query split.
+# Test queries tied for maximum top-3 disagreement (zero shared PIDs).
 EXAMPLE_QUERIES = [
     "where does the water that is produced by cellular respiration go",
     "how do i use sunpass on peach pass roads",
-    "who was the first woman in space in india",
-    "what does the anterior cingulate cortex do",
+    "what is the highest level for a mountain in skylanders superchargers",
+    "which part of the brain controls emotion - cerebral hemisphere",
 ]
 
 
