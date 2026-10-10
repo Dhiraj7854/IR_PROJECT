@@ -1,131 +1,172 @@
-# Two-Stage Neural Ranking System
+# Two-Stage Neural Passage Ranking
 
-A Python framework for a two-stage neural ranking system (BM25 retrieval + cross-encoder re-ranking) compared against TF-IDF and bi-encoder baselines.
+This project builds and evaluates an MS MARCO passage-retrieval pipeline that compares sparse lexical retrieval (TF-IDF and BM25), dense bi-encoder retrieval, and a two-stage BM25-plus-cross-encoder ranker. It includes data preparation, training and evaluation CLIs, latency/quality comparisons, retrieval ablations, and a Gradio demo. Neural training and full-corpus encoding are intended for a GPU runtime such as Google Colab; lexical baselines and unit tests can run on CPU.
 
-## Project Structure
+## Architecture
 
-```
-neural-ranking/
-├── configs/
-│   └── config.yaml          # Dataset, model, training, and top-k retrieval configuration
-├── src/
-│   ├── __init__.py
-│   ├── config.py            # Typed dataclass config loader
-│   ├── data.py              # Data loading & preprocessing
-│   ├── baseline.py          # TF-IDF & BM25 sparse baselines
-│   ├── biencoder.py         # Dense bi-encoder candidate retrieval
-│   ├── crossencoder.py      # Cross-encoder joint scoring re-ranker
-│   ├── evaluate.py          # Evaluation metrics (MRR, NDCG, MAP, Recall)
-│   └── experiments.py       # Comparative benchmarking pipeline
-├── scripts/                 # CLI entry points with argparse skeletons
-│   ├── run_baselines.py
-│   ├── train_biencoder.py
-│   ├── train_crossencoder.py
-│   ├── rerank.py
-│   ├── evaluate.py
-│   └── run_experiments.py
-├── notebooks/               # Jupyter notebooks for analysis
-├── tests/                   # Test suite
-│   ├── __init__.py
-│   └── test_config.py       # Configuration loading tests
-├── data/                    # Corpus and query datasets
-├── artifacts/               # Checkpoints, runs, and evaluation metrics
-├── requirements.txt         # Pinned dependency specifications
-├── pyproject.toml           # Project build specifications
-└── .gitignore               # Ignored files (data, artifacts, cache, venv)
+```mermaid
+flowchart LR
+    D[MS MARCO source data] --> P[Prepare corpus, query splits, qrels, triplets]
+    P --> L[TF-IDF / BM25 indexes]
+    P --> B[Fine-tune bi-encoder]
+    P --> C[Fine-tune cross-encoder]
+    L --> LR[TF-IDF and BM25 runs]
+    B --> BR[Bi-encoder val/test runs]
+    L -->|top 100 candidates| C
+    C --> CR[Cross-encoder reranked val/test runs]
+    LR --> E[Metrics, comparison table, Pareto plot]
+    BR --> E
+    CR --> E
+    L --> G[Gradio demo: BM25 vs cross-encoder]
+    C --> G
 ```
 
-## Quickstart
+## Setup
+
+Run commands from this directory (`neural-ranking/`). Python 3.10–3.12 and a CUDA-enabled PyTorch runtime are recommended for training; CPU is sufficient for tests and lexical retrieval. Install the pinned dependencies:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Verify configuration
-python -c "from src.config import load_config; print(load_config('configs/config.yaml'))"
-
-# Run tests
-pytest tests/
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
-## Run lexical retrieval baselines
-
-From the project root, run:
+On Colab, clone the repository, enter `neural-ranking/`, enable a GPU runtime, and install the same dependencies:
 
 ```bash
-python scripts/run_baseline.py
-```
-
-This builds or loads the cached TF-IDF and BM25 indexes in `artifacts/`, logs
-indexing time and per-query latency, and writes TREC-format runs for the
-validation and test splits to `artifacts/runs/{tfidf,bm25}_{val,test}.txt`.
-
-## Train and evaluate the bi-encoder in Colab
-
-The processed parquet files are not checked into the repository. In Colab,
-clone the repository, mount Drive, and copy `data/processed/` from Drive into
-the project before training:
-
-```python
 !git clone https://github.com/Dhiraj7854/IR_PROJECT.git
 %cd /content/IR_PROJECT/neural-ranking
-from google.colab import drive
-drive.mount("/content/drive")
-!cp -r /content/drive/MyDrive/IR_PROJECT/neural-ranking/data/processed ./data/
-%pip install "sentence-transformers==3.4.1" pandas pyarrow pyyaml
+%pip install -r requirements.txt
+%pip install -e ".[dev]"
 ```
 
-Run training and full-corpus evaluation from the project directory:
+Prepare the MS MARCO data once. This downloads the configured source and writes the processed corpus, splits, qrels, and training triplets under `data/processed/`:
 
 ```bash
-python scripts/train_biencoder.py
-python scripts/eval_biencoder.py
+python scripts/prepare_data.py --config configs/config.yaml --output_dir data/processed
 ```
 
-Training uses the settings in `configs/config.yaml`, evaluates MRR@10 each
-epoch on a 2,000-passage validation sample, and saves the best checkpoint to
-`artifacts/biencoder/`. Full-corpus passage vectors are cached there at
-`corpus_embeddings.npy`. Evaluation writes TREC runs to
-`artifacts/runs/biencoder_val.txt` and `artifacts/runs/biencoder_test.txt`.
-Copy `artifacts/biencoder/` and `artifacts/runs/` back to Drive if they need to
-persist after the Colab runtime ends.
+Generated data, model checkpoints, runs, and result files are ignored by Git. Keep them in Colab/Drive or copy them into the matching local directories before running downstream steps.
 
-## Compare all systems on the test split
+## Reproduce all results
 
-After producing the four test runs and saving both neural checkpoints, run:
+All commands below are run from `neural-ranking/` after data preparation. Training, corpus embedding, cross-encoder reranking, the full comparison, and the model-backed demo require the corresponding checkpoints; use a Colab GPU for those stages.
+
+### 1. Lexical baselines
+
+Build/load the cached TF-IDF and BM25 indexes; generate validation and test TREC runs and log indexing/query latency:
 
 ```bash
-python scripts/run_all_eval.py
+python scripts/run_baseline.py --splits val test --methods tfidf bm25 --top-k 100
 ```
 
-The evaluator computes per-query and macro-average MRR@10, NDCG@10, P@5, and
-Recall@100 with `ranx`. It measures median end-to-end latency over the first
-200 test queries and writes comparison tables, per-query metrics, and a
-log-latency Pareto plot under `artifacts/results/`. Suspicious MRR ranges are
-reported as warnings in the log and comparison output.
+Run files are `artifacts/runs/{tfidf,bm25}_{val,test}.txt`.
 
-With 3,500 triplets, batch size 64, and two epochs, training has about 110
-optimizer steps, so the requested two-epoch configuration cannot produce a
-500-step loss trace. The script logs a mean loss every 50 optimizer steps;
-loss decrease is measured, not guaranteed for stochastic optimization.
+### 2. Bi-encoder
 
-## Train and evaluate the cross-encoder
-
-Use the same Colab setup and processed data. The explicit PyTorch loop mines two
-BM25 negatives per training query and initializes the backbone from
-`cross-encoder/ms-marco-MiniLM-L-6-v2`:
+Train the configured MiniLM bi-encoder with hard negatives, then encode the corpus once and produce val/test runs:
 
 ```bash
-python scripts/train_crossencoder.py
-python scripts/eval_crossencoder.py
+python scripts/train_biencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/biencoder --negatives hard
+python scripts/eval_biencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --model artifacts/biencoder --splits val test
 ```
 
-Training defaults to batch size 32, learning rate `2e-5`, two epochs, 10% linear
-warmup, and CUDA fp16 when available. The best validation-MRR checkpoint is
-saved in `artifacts/crossencoder/`. Evaluation re-ranks BM25's top 100 passages
-and writes `artifacts/runs/crossencoder_{val,test}.txt`; it also reports
-cross-encoder reranking milliseconds per query.
+Use `--negatives random` to reproduce the random-negative ablation checkpoint instead:
 
-For a small overfit/sanity run, the training script supports `--max-train-queries
-100 --epochs 10`; compare training loss and validation MRR in the logs. Use
-`--no-fp16` to debug on CPU, though full training is intended for a Colab GPU.
+```bash
+python scripts/train_biencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/biencoder_random --negatives random
+```
+
+### 3. Cross-encoder
+
+Train the explicit PyTorch cross-encoder and generate BM25 top-100 → reranked val/test runs:
+
+```bash
+python scripts/train_crossencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/crossencoder
+python scripts/eval_crossencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --model artifacts/crossencoder --candidate-depth 100 --splits val test
+```
+
+For the documented small overfit diagnostic, train on 100 queries for more epochs and inspect logged loss/validation MRR:
+
+```bash
+python scripts/train_crossencoder.py --data-dir data/processed --output-dir artifacts/crossencoder_overfit --max-train-queries 100 --epochs 10
+```
+
+### 4. Evaluate, compare, and plot
+
+Compute per-query and macro metrics, median latency measured on 200 test queries, and the test-set Pareto plot:
+
+```bash
+python scripts/run_all_eval.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --latency-queries 200
+```
+
+Outputs: `artifacts/results/comparison_table.md`, `comparison_table.csv`, `per_query_metrics.csv`, and `pareto.png`. The runner flags suspicious MRR values rather than treating them as accepted results. To inspect the table and plot interactively, open [`notebooks/02_results.ipynb`](notebooks/02_results.ipynb) from this directory after evaluation.
+
+Evaluate an individual TREC run with the same project's metrics:
+
+```bash
+python scripts/evaluate.py --run_file artifacts/runs/bm25_test.txt --qrels_file data/processed/test_qrels.parquet --output_file artifacts/results/bm25_test_metrics.json
+```
+
+### 5. Ablations
+
+Run the random-vs-hard negative, BM25 rerank-depth, and query-length experiments:
+
+```bash
+python scripts/run_experiments.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts
+```
+
+By default the random-negative model is retrained for two epochs. Use `--reuse-random-checkpoint` if `artifacts/biencoder_random/` already contains the trained checkpoint. The report and 150-dpi figures are written to `artifacts/results/ablations.md` and `ablations_*.png`.
+
+### 6. Tests and command help
+
+```bash
+python -m pytest -q
+python scripts/prepare_data.py --help
+python scripts/run_baseline.py --help
+python scripts/train_biencoder.py --help
+python scripts/eval_biencoder.py --help
+python scripts/train_crossencoder.py --help
+python scripts/eval_crossencoder.py --help
+python scripts/evaluate.py --help
+python scripts/run_all_eval.py --help
+python scripts/run_experiments.py --help
+```
+
+## Current comparison results
+
+The lexical rows below are calculated from the existing test runs and `test_qrels.parquet`; TF-IDF and BM25 latency was measured over the first 200 test queries on this local CPU with the cached index. The full comparison outputs (`comparison_table.csv`, `comparison_table.md`, and `pareto.png`) are not present, and this checkout does not include neural checkpoints/runs. Neural results are therefore marked unavailable rather than estimated. Run the evaluation commands above after Colab training to generate the complete four-system comparison and plot.
+
+| System | MRR@10 | NDCG@10 | P@5 | Recall@100 | Median latency (ms/query) |
+|---|---:|---:|---:|---:|---:|
+| TF-IDF | 0.2943 | 0.3854 | 0.1091 | 0.9073 | 35.95 |
+| BM25 | 0.3316 | 0.4230 | 0.1192 | 0.9087 | 97.32 |
+| Bi-encoder | Not generated | Not generated | Not generated | Not generated | Not generated |
+| BM25 → Cross-encoder | Not generated | Not generated | Not generated | Not generated | Not generated |
+
+Lexical metric outputs are in `artifacts/results/tfidf_test_metrics.json` and
+`artifacts/results/bm25_test_metrics.json`; latency measurements and their
+environment/sample are recorded in
+[`artifacts/results/baseline_latency_local.json`](artifacts/results/baseline_latency_local.json).
+Latencies are local CPU measurements; the complete comparison runner remeasures
+all four systems on its execution hardware and writes the final table.
+
+### Pareto plot
+
+Generated as [`artifacts/results/pareto.png`](artifacts/results/pareto.png) by `scripts/run_all_eval.py`. It plots median end-to-end latency (logarithmic x-axis) against test MRR@10, with a labeled point for each system. The complete plot is not available yet because neural runs and checkpoints are absent; the two measured lexical points are insufficient for the requested all-system figure.
+
+## Gradio demo
+
+[`app/demo.py`](app/demo.py) is a Gradio Blocks application comparing BM25 top-10 with BM25 top-100 followed by cross-encoder reranking. It loads the corpus, lexical index, bi-encoder/cached embeddings, and cross-encoder once at startup; then displays rank, PID, score, a short passage excerpt, and per-column latency. Copy the trained checkpoints and bi-encoder embedding cache into `artifacts/`, install dependencies, and launch from this directory:
+
+```bash
+python app/demo.py
+```
+
+The current source includes four example queries from the test split. They have not been verified as the four largest top-3 disagreements because the necessary trained cross-encoder artifacts are not present in this checkout.
+
+## Research report
+
+[`report_skeleton.md`](report_skeleton.md) provides the paper/report structure and required literature citations. Populate its result tables from `artifacts/results/` after the model runs complete; analysis sections are intentionally left for the project author.
