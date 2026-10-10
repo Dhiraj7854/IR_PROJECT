@@ -149,3 +149,4 @@ def test_all_qrels_pids_in_corpus(corpus_df, train_qrels, val_qrels, test_qrels)
         qrel_pids = set(qrels_df["relevant_pid"])
         missing = qrel_pids - corpus_pids
         assert len(missing) == 0, f"{split_name} qrels has pids not in the 100k corpus: {missing}"
+
