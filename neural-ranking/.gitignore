@@ -1,29 +1,46 @@
-# Data and generated artifacts
+# Local datasets and generated model/index/run outputs
 data/
 artifacts/
 
-# Python byte-compiled / cache files
+# Python bytecode and test/type-check caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
 
-# Virtual environments
+# Virtual environments and package-manager environments
 .venv/
 venv/
 ENV/
 env/
+.conda/
 
-# Jupyter Notebook checkpoints
+# Jupyter checkpoints and temporary notebook files
 .ipynb_checkpoints/
+*.ipynb~
 
-# Testing & coverage
-.pytest_cache/
+# Test coverage output
 .coverage
+.coverage.*
 htmlcov/
 
-# Build and distribution
+# Build and distribution output
 build/
 dist/
 *.egg-info/
 
+# Logs and temporary/editor files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local editor settings
+.vscode/

@@ -5,11 +5,10 @@ sentence-transformers==3.4.1
 datasets==3.3.2
 rank-bm25==0.2.2
 scikit-learn==1.6.1
-pytrec_eval==0.5
+ranx==0.3.20
 pandas==2.2.3
 pyyaml==6.0.2
 tqdm==4.67.1
 matplotlib==3.10.0
 gradio==5.16.0
 pytest==8.3.4
-

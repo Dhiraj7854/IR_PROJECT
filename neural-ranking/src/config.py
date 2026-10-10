@@ -98,9 +98,12 @@ class ModelsConfig:
 class TrainingConfig:
     """Model training hyperparameters."""
 
-    batch_size: int = 32
+    batch_size: int = 64
     lr: float = 0.00002
-    epochs: int = 3
+    epochs: int = 2
+    fp16: bool = True
+    warmup_ratio: float = 0.1
+    early_stopping_patience: int = 1
 
 
 @dataclass
@@ -248,9 +251,14 @@ def load_config(path: Union[str, Path] = "configs/config.yaml") -> Config:
     # Parse training section
     training_raw = raw_cfg.get("training", {})
     training = TrainingConfig(
-        batch_size=int(training_raw.get("batch_size", 32)),
+        batch_size=int(training_raw.get("batch_size", 64)),
         lr=float(training_raw.get("lr", 0.00002)),
-        epochs=int(training_raw.get("epochs", 3)),
+        epochs=int(training_raw.get("epochs", 2)),
+        fp16=bool(training_raw.get("fp16", True)),
+        warmup_ratio=float(training_raw.get("warmup_ratio", 0.1)),
+        early_stopping_patience=int(
+            training_raw.get("early_stopping_patience", 1)
+        ),
     )
 
     # Parse retrieval section
@@ -270,4 +278,3 @@ def load_config(path: Union[str, Path] = "configs/config.yaml") -> Config:
         training=training,
         retrieval=retrieval,
     )
-

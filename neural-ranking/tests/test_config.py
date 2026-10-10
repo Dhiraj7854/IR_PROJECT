@@ -51,9 +51,12 @@ def test_load_config_valid():
 
     # Training checks
     assert isinstance(cfg.training, TrainingConfig)
-    assert cfg.training.batch_size == 32
+    assert cfg.training.batch_size == 64
     assert math.isclose(cfg.training.lr, 2.0e-5, rel_tol=1e-6)
-    assert cfg.training.epochs == 3
+    assert cfg.training.epochs == 2
+    assert cfg.training.fp16 is True
+    assert math.isclose(cfg.training.warmup_ratio, 0.1)
+    assert cfg.training.early_stopping_patience == 1
 
     # Retrieval top-k checks
     assert isinstance(cfg.retrieval, RetrievalConfig)
@@ -73,9 +76,9 @@ def test_config_convenience_properties():
     assert cfg.biencoder_name == "sentence-transformers/all-MiniLM-L6-v2"
     assert cfg.crossencoder_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
     assert cfg.max_seq_len == 256
-    assert cfg.batch_size == 32
+    assert cfg.batch_size == 64
     assert math.isclose(cfg.lr, 2.0e-5, rel_tol=1e-6)
-    assert cfg.epochs == 3
+    assert cfg.epochs == 2
     assert cfg.stage1_top_k == 100
     assert cfg.top_k_stage1 == 100
     assert cfg.rerank_depth == 50
@@ -99,4 +102,3 @@ if __name__ == "__main__":
     test_config_convenience_properties()
     test_load_config_file_not_found()
     print("All tests passed successfully!")
-
