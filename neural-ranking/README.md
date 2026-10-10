@@ -129,3 +129,20 @@ cross-encoder reranking milliseconds per query.
 For a small overfit/sanity run, the training script supports `--max-train-queries
 100 --epochs 10`; compare training loss and validation MRR in the logs. Use
 `--no-fp16` to debug on CPU, though full training is intended for a Colab GPU.
+
+## Run retrieval ablations
+
+After preparing the data and training the hard-negative bi-encoder and
+cross-encoder, run all three ablations from the project root:
+
+```bash
+python scripts/run_experiments.py
+```
+
+The runner retrains a same-configuration, two-epoch random-negative bi-encoder
+(`--negatives random`) and compares it with `artifacts/biencoder/`. It also
+compares BM25 candidate depths 50/100/200 for cross-encoder re-ranking on the
+validation split. Query-length buckets are evaluated on the test split as
+specified. The report and three 150-dpi figures are saved under
+`artifacts/results/`; use `--reuse-random-checkpoint` to reuse an existing
+`artifacts/biencoder_random/` checkpoint instead of retraining.

@@ -26,6 +26,7 @@ from sentence_transformers import InputExample, SentenceTransformer
 from sentence_transformers import losses as st_losses
 from src.config import load_config
 from src.biencoder import DEFAULT_MODEL_NAME
+from src.experiments import sample_random_negative_texts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--val-sample-size", type=int, default=2000)
+    parser.add_argument(
+        "--negatives",
+        choices=("hard", "random"),
+        default="hard",
+        help="Use mined hard negatives from train_triplets or sample random corpus passages.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -164,27 +171,58 @@ def _load_frame(data_dir: Path, filename: str, required_columns: set[str]) -> pd
     return frame
 
 
-def _create_training_examples(triplets: pd.DataFrame) -> List[InputExample]:
+def _create_training_examples(
+    triplets: pd.DataFrame,
+    negatives: str = "hard",
+    corpus_df: pd.DataFrame | None = None,
+    seed: int = 42,
+) -> List[InputExample]:
     required = {"query_text", "pos_text", "neg_text"}
     missing = required.difference(triplets.columns)
     if missing:
         raise ValueError(f"Training triplets are missing columns: {sorted(missing)}")
+    if negatives not in {"hard", "random"}:
+        raise ValueError("negatives must be either 'hard' or 'random'")
+    if negatives == "random":
+        if corpus_df is None or not {"pid", "passage_text"}.issubset(corpus_df.columns):
+            raise ValueError(
+                "Random negatives require corpus_df with pid and passage_text columns"
+            )
+        if len(corpus_df) < 2 or corpus_df["pid"].duplicated().any():
+            raise ValueError(
+                "Random-negative corpus must contain at least two unique passage IDs"
+            )
+        if "pos_pid" not in triplets.columns:
+            raise ValueError("Random negatives require pos_pid in the training triplets")
     if triplets[list(required)].isna().any().any():
         raise ValueError("Training triplet text columns must not contain null values")
 
+    random_negatives: List[str] | None = None
+    if negatives == "random" and corpus_df is not None:
+        random_negatives = sample_random_negative_texts(
+            corpus_df,
+            triplets["pos_pid"].astype(int).tolist(),
+            seed=seed,
+        )
+
     examples: List[InputExample] = []
-    for row in triplets.itertuples(index=False):
+    for index, row in enumerate(triplets.itertuples(index=False)):
         query = str(row.query_text).strip()
         positive = str(row.pos_text).strip()
-        hard_negative = str(row.neg_text).strip()
-        if not query or not positive or not hard_negative:
+        if negatives == "hard":
+            negative = str(row.neg_text).strip()
+        else:
+            if random_negatives is None:
+                raise RuntimeError("Random-negative corpus was not initialized")
+            negative = random_negatives[index]
+        if not query or not positive or not negative:
             continue
         # MNRL treats column 0 as the anchor, column 1 as its positive, and
         # column 2 as an explicit hard negative. A query-negative pair alone
         # would incorrectly label the negative passage as relevant.
-        examples.append(InputExample(texts=[query, positive, hard_negative]))
+        examples.append(InputExample(texts=[query, positive, negative]))
     if not examples:
-        raise ValueError("No usable query/positive/hard-negative triplets found")
+        raise ValueError(f"No usable query/positive/{negatives}-negative triplets found")
     return examples
 
 
@@ -245,7 +283,12 @@ def main() -> None:
         sample_size=args.val_sample_size,
         seed=args.seed,
     )
-    examples = _create_training_examples(triplets_df)
+    examples = _create_training_examples(
+        triplets_df,
+        negatives=args.negatives,
+        corpus_df=corpus_df,
+        seed=args.seed,
+    )
 
     model_name = args.model_name or config.models.biencoder_name or DEFAULT_MODEL_NAME
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -358,6 +401,7 @@ def main() -> None:
             (output_dir / "training_metrics.json").write_text(
                 json.dumps(
                     {
+                        "negative_strategy": args.negatives,
                         "best_val_mrr@10": best_mrr,
                         "epochs": metrics,
                         "global_steps": global_step,
