@@ -312,6 +312,7 @@ def render_insights(
         bm25_top = [p for p, _ in bm25_hits[:top_k]]
         cross_top = [p for p, _ in cross_hits[:top_k]]
         overlap = len(set(bm25_top) & set(cross_top))
+        overlap_pct = 100.0 * overlap / max(1, len(set(bm25_top) | set(cross_top)))
         tiles.append(_tile(f"Top-{top_k} overlap", f"{overlap}/{top_k}", "BM25 vs cross-encoder"))
         changed = bool(bm25_top) and bool(cross_top) and bm25_top[0] != cross_top[0]
         tiles.append(
@@ -328,6 +329,16 @@ def render_insights(
                 tiles.append(_tile("Biggest jump", f"▲ {gain}", f"PID {pid}: BM25 #{old} → #{new}"))
         rescued = sum(1 for p in cross_top if bm25_rank.get(p, depth + 1) > top_k)
         tiles.append(_tile("Pulled up from below", str(rescued), f"cross-encoder top-{top_k} hits that BM25 ranked past #{top_k}"))
+        donut = f"""
+<div class="overlap-card">
+  <div class="donut" style="--overlap:{overlap_pct:.1f}%"><span>{overlap_pct:.0f}%</span></div>
+  <div><strong>Result-set overlap</strong><div class="overlap-legend">
+    <span><i class="legend-shared"></i>{overlap} shared passages</span>
+    <span><i class="legend-different"></i>{len(set(bm25_top) | set(cross_top)) - overlap} unique to one ranking</span>
+  </div></div>
+</div>"""
+    else:
+        donut = ""
     tiles.append(_tile("Query terms", f"{len(query_terms(query))}", ", ".join(query_terms(query)[:6]) or "—"))
 
     longest = max(timings.values()) if timings else 1.0
@@ -342,7 +353,7 @@ def render_insights(
         )
     return f"""
 <div class="insights">
-  <div class="tiles">{''.join(tiles)}</div>
+  <div class="insight-main"><div class="tiles">{''.join(tiles)}</div>{donut}</div>
   <div class="latency"><h4>Latency</h4>{''.join(bars)}
   <p class="fine">The cross-encoder time includes the shared BM25 stage-1 retrieval.</p></div>
 </div>"""
@@ -354,21 +365,237 @@ def _read_benchmark() -> List[Dict[str, object]]:
         try:
             with path.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
-            if rows and "System" in rows[0]:
-                parsed = []
+            if rows:
+                aliases = {
+                    "system": "System",
+                    "mrr@10": "MRR@10",
+                    "ndcg@10": "NDCG@10",
+                    "p@5": "P@5",
+                    "recall@100": "Recall@100",
+                    "median_latency_ms": "Median latency (ms/query)",
+                }
+                parsed: List[Dict[str, object]] = []
                 for row in rows:
-                    parsed.append(
-                        {k: (float(v) if k != "System" else v) for k, v in row.items() if v not in (None, "")}
-                    )
-                return parsed
+                    normalised: Dict[str, object] = {}
+                    for key, value in row.items():
+                        if value in (None, ""):
+                            continue
+                        label = aliases.get(key.strip().lower(), key)
+                        normalised[label] = value if label == "System" else float(value)
+                    if "System" in normalised:
+                        parsed.append(normalised)
+                if parsed:
+                    return parsed
         except (ValueError, OSError) as exc:  # fall back to the README numbers
             logger.warning("Could not parse %s: %s", path, exc)
     return FALLBACK_BENCHMARK
 
 
+def _read_ablation_tables() -> List[List[Dict[str, object]]]:
+    """Read the three ablation tables from the generated Markdown report."""
+    path = RESULTS_DIR / "ablations.md"
+    if not path.is_file():
+        return []
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return []
+
+    tables: List[List[Dict[str, object]]] = []
+    for section in re.split(r"(?m)^##\s+\d+\.", content)[1:]:
+        lines = [line.strip() for line in section.splitlines() if line.strip().startswith("|")]
+        if len(lines) < 3:
+            continue
+        headers = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        rows: List[Dict[str, object]] = []
+        for line in lines[2:]:
+            values = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(values) != len(headers):
+                continue
+            parsed: Dict[str, object] = {}
+            for header, value in zip(headers, values):
+                try:
+                    parsed[header] = float(value)
+                except ValueError:
+                    parsed[header] = value
+            rows.append(parsed)
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _chart_card(title: str, subtitle: str, svg: str, extra_class: str = "") -> str:
+    return f"""
+<section class="chart-card {extra_class}">
+  <div class="chart-heading"><div><h3>{html.escape(title)}</h3>
+    <p>{html.escape(subtitle)}</p></div></div>
+  <div class="chart-viewport">{svg}</div>
+</section>"""
+
+
+def _render_pareto_chart(rows: Sequence[Dict[str, object]]) -> str:
+    """Render quality versus latency as a responsive, accessible inline SVG."""
+    points = []
+    for row in rows:
+        try:
+            points.append(
+                (str(row["System"]), float(row["MRR@10"]), float(row["Median latency (ms/query)"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not points:
+        return '<div class="chart-empty">No quality/latency metrics available.</div>'
+
+    width, height = 760, 390
+    left, right, top, bottom = 82, 30, 24, 68
+    plot_w, plot_h = width - left - right, height - top - bottom
+    x_max = max(p[2] for p in points) * 1.12 or 1.0
+    y_max = max(p[1] for p in points) * 1.15 or 1.0
+    parts = ['<svg class="data-chart" viewBox="0 0 760 390" role="img" aria-label="MRR at 10 versus median latency scatter plot">']
+    for i in range(5):
+        y = top + plot_h * i / 4
+        value = y_max * (1 - i / 4)
+        parts.append(f'<line class="grid-line" x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}"/>')
+        parts.append(f'<text class="axis-tick" x="{left-12}" y="{y+4:.1f}" text-anchor="end">{value:.2f}</text>')
+    for i in range(5):
+        x = left + plot_w * i / 4
+        value = x_max * i / 4
+        parts.append(f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top+plot_h}"/>')
+        parts.append(f'<text class="axis-tick" x="{x:.1f}" y="{top+plot_h+22}" text-anchor="middle">{value:.0f}</text>')
+    parts.extend([
+        f'<line class="axis-line" x1="{left}" y1="{top+plot_h}" x2="{width-right}" y2="{top+plot_h}"/>',
+        f'<line class="axis-line" x1="{left}" y1="{top}" x2="{left}" y2="{top+plot_h}"/>',
+        f'<text class="axis-label" x="{left+plot_w/2}" y="{height-12}" text-anchor="middle">Median latency (ms/query) · lower is faster</text>',
+        f'<text class="axis-label" transform="translate(19 {top+plot_h/2}) rotate(-90)" text-anchor="middle">MRR@10 · higher is better</text>',
+    ])
+    for idx, (name, mrr, latency) in enumerate(points):
+        x = left + latency / x_max * plot_w
+        y = top + (1 - mrr / y_max) * plot_h
+        color = SYSTEMS.get(name, ("", "#64748b", ""))[1]
+        label = name.replace(" → ", " + ")
+        label_y = y - 15 if idx % 2 == 0 else y + 25
+        parts.append(
+            f'<g class="plot-point" tabindex="0"><title>{html.escape(name)} · MRR@10 {mrr:.4f} · {latency:.1f} ms/query</title>'
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{color}"/>'
+            f'<text class="point-label" x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle">{html.escape(label)}</text></g>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_negative_chart(rows: Sequence[Dict[str, object]]) -> str:
+    """Render hard/random validation MRR as a clear native SVG bar chart."""
+    data = [(str(r.get("Negative strategy", "")), float(r.get("MRR@10", 0))) for r in rows]
+    if not data:
+        return '<div class="chart-empty">No negative-sampling results available.</div>'
+    width, height, left = 650, 205, 150
+    max_value = max(max(value for _, value in data) * 1.16, 0.1)
+    parts = [f'<svg class="data-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Validation MRR at 10 for hard versus random negatives">']
+    for i in range(4):
+        x = left + (width - left - 48) * i / 3
+        parts.append(f'<line class="grid-line vertical" x1="{x:.1f}" y1="24" x2="{x:.1f}" y2="158"/>')
+        parts.append(f'<text class="axis-tick" x="{x:.1f}" y="180" text-anchor="middle">{max_value*i/3:.2f}</text>')
+    for i, (name, value) in enumerate(data):
+        y = 50 + i * 68
+        color = "#6366f1" if name.lower() == "hard" else "#10b981"
+        bar_w = (width - left - 48) * value / max_value
+        parts.extend([
+            f'<text class="axis-tick row-label" x="{left-14}" y="{y+5}" text-anchor="end">{html.escape(name.title())}</text>',
+            f'<rect class="chart-bar" x="{left}" y="{y-13}" width="{bar_w:.1f}" height="26" rx="8" fill="{color}"><title>{value:.4f} MRR@10</title></rect>',
+            f'<text class="bar-value" x="{left+bar_w+9:.1f}" y="{y+5}">{value:.4f}</text>',
+        ])
+    parts.extend([
+        f'<text class="axis-label" x="{left+(width-left-48)/2}" y="201" text-anchor="middle">Validation MRR@10</text>',
+        "</svg>",
+    ])
+    return "".join(parts)
+
+
+def _render_depth_chart(rows: Sequence[Dict[str, object]]) -> str:
+    """Plot reranking quality and latency together to show the depth trade-off."""
+    data = []
+    for row in rows:
+        try:
+            data.append((float(row["BM25 candidate depth"]), float(row["MRR@10"]),
+                         float(row["Median BM25 + re-ranking latency (ms/query)"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not data:
+        return '<div class="chart-empty">No reranking-depth results available.</div>'
+    width, height, left, right, top, bottom = 650, 285, 68, 28, 28, 62
+    plot_w, plot_h = width-left-right, height-top-bottom
+    x0, x1 = min(d[2] for d in data), max(d[2] for d in data)
+    if x1 == x0:
+        x1 += 1
+    y1 = max(d[1] for d in data) * 1.18 or 1.0
+    coords = [(left+(lat-x0)/(x1-x0)*plot_w, top+(1-mrr/y1)*plot_h, depth, mrr, lat)
+              for depth, mrr, lat in data]
+    parts = ['<svg class="data-chart" viewBox="0 0 650 285" role="img" aria-label="Reranking depth trade-off between validation MRR and latency">']
+    for i in range(4):
+        y = top + plot_h*i/3
+        parts.append(f'<line class="grid-line" x1="{left}" y1="{y:.1f}" x2="{left+plot_w}" y2="{y:.1f}"/>')
+        parts.append(f'<text class="axis-tick" x="{left-10}" y="{y+4:.1f}" text-anchor="end">{y1*(1-i/3):.2f}</text>')
+        x = left + plot_w*i/3
+        latency_tick = x0 + (x1-x0)*i/3
+        parts.append(f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top+plot_h}"/>')
+        parts.append(f'<text class="axis-tick" x="{x:.1f}" y="{top+plot_h+20}" text-anchor="middle">{latency_tick:.0f}</text>')
+    line_points = " ".join(f"{x:.1f},{y:.1f}" for x, y, *_ in coords)
+    parts.append(f'<polyline class="chart-line" points="{line_points}"/>')
+    for x, y, depth, mrr, latency in coords:
+        parts.append(f'<g class="plot-point" tabindex="0"><title>Depth {depth:.0f} · MRR@10 {mrr:.4f} · {latency:.1f} ms/query</title>'
+                     f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="#8b5cf6"/>'
+                     f'<text class="point-label" x="{x:.1f}" y="{y-15:.1f}" text-anchor="middle">top-{depth:.0f}</text></g>')
+    parts.extend([
+        f'<text class="axis-label" x="{left+plot_w/2}" y="{height-10}" text-anchor="middle">BM25 + re-ranking latency (ms/query)</text>',
+        f'<text class="axis-label" transform="translate(17 {top+plot_h/2}) rotate(-90)" text-anchor="middle">Validation MRR@10</text>',
+        "</svg>",
+    ])
+    return "".join(parts)
+
+
+def _render_query_length_chart(rows: Sequence[Dict[str, object]]) -> str:
+    """Render BM25 and cross-encoder MRR by query-length bucket."""
+    data = []
+    for row in rows:
+        try:
+            data.append((str(row["Query bucket"]), float(row["BM25 MRR@10"]),
+                         float(row["Cross-encoder MRR@10"]), str(row["Word-count range"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not data:
+        return '<div class="chart-empty">No query-length results available.</div>'
+    width, height, top, bottom = 760, 290, 30, 68
+    plot_h = height-top-bottom
+    max_value = max(max(d[1], d[2]) for d in data) * 1.2 or 1.0
+    chart_w = 160
+    lefts = [100 + i * 225 for i in range(len(data))]
+    parts = ['<svg class="data-chart" viewBox="0 0 760 290" role="img" aria-label="BM25 and cross-encoder MRR by query length">']
+    for i in range(4):
+        y = top + plot_h*i/3
+        parts.append(f'<line class="grid-line" x1="66" y1="{y:.1f}" x2="730" y2="{y:.1f}"/>')
+        parts.append(f'<text class="axis-tick" x="56" y="{y+4:.1f}" text-anchor="end">{max_value*(1-i/3):.2f}</text>')
+    for left, (bucket, bm25, cross, word_range) in zip(lefts, data):
+        bw = 42
+        for offset, value, color, label in [(12, bm25, "#3b82f6", "BM25"), (67, cross, "#8b5cf6", "Cross-encoder")]:
+            bar_h = plot_h * value / max_value
+            y = top + plot_h - bar_h
+            parts.append(f'<rect class="chart-bar" x="{left+offset}" y="{y:.1f}" width="{bw}" height="{bar_h:.1f}" rx="7" fill="{color}"><title>{html.escape(bucket)} · {label}: {value:.4f}</title></rect>')
+            parts.append(f'<text class="bar-value" x="{left+offset+bw/2}" y="{y-7:.1f}" text-anchor="middle">{value:.3f}</text>')
+        parts.append(f'<text class="axis-tick bucket-label" x="{left+chart_w/2}" y="{height-35}" text-anchor="middle">{html.escape(bucket.title())}</text>')
+        parts.append(f'<text class="axis-tick" x="{left+chart_w/2}" y="{height-15}" text-anchor="middle">{html.escape(word_range)} words</text>')
+    parts.extend([
+        '<g class="chart-legend"><rect x="520" y="5" width="12" height="12" rx="3" fill="#3b82f6"/><text x="538" y="16">BM25</text>'
+        '<rect x="598" y="5" width="12" height="12" rx="3" fill="#8b5cf6"/><text x="616" y="16">Cross-encoder</text></g>',
+        "</svg>",
+    ])
+    return "".join(parts)
+
+
 def render_benchmark() -> str:
     rows = _read_benchmark()
-    metrics = [k for k in rows[0] if k != "System"]
+    preferred_metrics = ["MRR@10", "NDCG@10", "P@5", "Recall@100", "Median latency (ms/query)"]
+    metrics = [metric for metric in preferred_metrics if any(metric in row for row in rows)]
     best = {}
     for metric in metrics:
         values = [r[metric] for r in rows if metric in r]
@@ -390,20 +617,39 @@ def render_benchmark() -> str:
         body.append(
             f'<tr><th><span class="dot" style="background:{color}"></span>{html.escape(row["System"])}</th>{"".join(cells)}</tr>'
         )
-    mrr = [(r["System"], r.get("MRR@10", 0.0)) for r in rows]
-    top = max(v for _, v in mrr) or 1.0
-    bars = "".join(
-        f'<div class="lrow"><span class="lname">{html.escape(n)}</span>'
-        f'<span class="ltrack"><span style="width:{100 * v / top:.1f}%;background:{SYSTEMS.get(n, ("", "#64748b", ""))[1]}"></span></span>'
-        f'<span class="lval">{v:.3f}</span></div>'
-        for n, v in mrr
+    pareto = _chart_card(
+        "Quality vs. speed",
+        "Each point is one retriever. Favor the upper-left: higher MRR with lower query latency.",
+        _render_pareto_chart(rows),
     )
+    ablations = _read_ablation_tables()
+    ablation_cards = ""
+    if len(ablations) >= 3:
+        ablation_cards = (
+            '<div class="chart-grid">'
+            + _chart_card("Negative sampling", "Validation MRR@10 · hard vs random training negatives",
+                          _render_negative_chart(ablations[0]))
+            + _chart_card("Candidate-depth trade-off", "Validation MRR@10 and total latency by BM25 depth",
+                          _render_depth_chart(ablations[1]))
+            + _chart_card("Query-length analysis", "Test MRR@10 by bucket · 250 queries per bucket",
+                          _render_query_length_chart(ablations[2]), "wide-chart")
+            + "</div>"
+        )
     return f"""
 <div class="bench">
+  <div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>
+    <h2>How the rankers compare</h2>
+    <p>Quality metrics are computed on the held-out test queries. Latency is the median over 200 queries.</p>
+  </div>
   <table><thead><tr><th>System</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>
   <p class="fine">Best value per column highlighted. 750 test queries, MS MARCO passages.
   *Cross-encoder Recall@100 was computed over a run file holding only its top-10, so it is not a true Recall@100.</p>
-  <div class="latency"><h4>MRR@10</h4>{bars}</div>
+  {pareto}
+  <div class="bench-intro ablation-intro"><span class="eyebrow">ABLATION STUDIES</span>
+    <h2>What changes the ranking?</h2>
+    <p>Validation experiments isolate training negatives and candidate depth; query-length results use the test split.</p>
+  </div>
+  {ablation_cards}
 </div>"""
 
 
@@ -488,6 +734,64 @@ details p { line-height: 1.55; margin: 6px 0 0; }
 .bench thead th { background: rgba(127,127,127,.1); }
 .bench td.best { font-weight: 700; color: #059669; }
 .examples { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Search insights */
+.insights { grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 16px; margin: 14px 0 18px; }
+.insight-main { min-width: 0; }
+.overlap-card { display: flex; align-items: center; gap: 14px; padding: 12px 16px; margin-top: 10px;
+  border: 1px solid var(--border-color-primary); border-radius: 14px; background: var(--block-background-fill); }
+.donut { width: 60px; height: 60px; flex: 0 0 60px; display: grid; place-items: center; border-radius: 50%;
+  background: conic-gradient(#6366f1 var(--overlap), rgba(127,127,127,.2) 0); position: relative; }
+.donut::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; background: var(--block-background-fill); }
+.donut span { z-index: 1; font-size: .82rem; font-weight: 750; }
+.overlap-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; font-size: .78rem; color: var(--body-text-color-subdued); }
+.overlap-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.overlap-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #6366f1; }
+.overlap-legend .legend-different { background: rgba(127,127,127,.35); }
+
+/* Benchmark charts are inline SVG so they scale crisply with the layout. */
+.bench { display: grid; gap: 16px; }
+.bench-intro { padding: 8px 2px 0; }
+.bench-intro h2 { margin: 3px 0 4px; font-size: 1.35rem; letter-spacing: -.02em; }
+.bench-intro p, .chart-heading p { margin: 0; color: var(--body-text-color-subdued); font-size: .86rem; }
+.eyebrow { color: #6366f1; font-size: .7rem; font-weight: 800; letter-spacing: .11em; }
+.bench table { display: block; overflow-x: auto; border-spacing: 0; }
+.bench td.best { color: #059669; }
+.chart-card { min-width: 0; padding: 16px 18px 12px; border: 1px solid var(--border-color-primary);
+  border-radius: 16px; background: var(--block-background-fill); box-shadow: 0 8px 24px rgba(15,23,42,.045); }
+.chart-heading h3 { margin: 0 0 4px; font-size: 1.02rem; }
+.chart-viewport { width: 100%; overflow: hidden; margin-top: 10px; }
+.data-chart { display: block; width: 100%; max-height: 420px; overflow: visible; }
+.grid-line { stroke: var(--border-color-primary); stroke-width: 1; opacity: .75; }
+.grid-line.vertical { stroke-dasharray: 3 5; }
+.axis-line { stroke: var(--body-text-color-subdued); stroke-width: 1.2; opacity: .7; }
+.axis-tick { fill: var(--body-text-color-subdued); font: 12px ui-sans-serif,system-ui,sans-serif; }
+.axis-label { fill: var(--body-text-color); font: 12px ui-sans-serif,system-ui,sans-serif; font-weight: 600; }
+.point-label { fill: var(--body-text-color); font: 12px ui-sans-serif,system-ui,sans-serif; font-weight: 650; }
+.plot-point { cursor: help; outline: none; }
+.plot-point circle { stroke: var(--block-background-fill); stroke-width: 3; transition: r .16s ease, filter .16s ease; }
+.plot-point:hover circle, .plot-point:focus circle { r: 11; filter: drop-shadow(0 3px 5px rgba(15,23,42,.25)); }
+.chart-bar { transform-box: fill-box; transform-origin: left center; animation: grow-in .75s cubic-bezier(.2,.75,.25,1) both; }
+.chart-line { fill: none; stroke: #8b5cf6; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.bar-value { fill: var(--body-text-color); font: 12px ui-sans-serif,system-ui,sans-serif; font-weight: 700; }
+.bucket-label { font-weight: 750; }
+.chart-legend { fill: var(--body-text-color); font: 11px ui-sans-serif,system-ui,sans-serif; }
+.chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.wide-chart { grid-column: 1 / -1; }
+.chart-empty { padding: 32px 12px; text-align: center; color: var(--body-text-color-subdued); }
+.ablation-intro { padding-top: 22px; }
+@keyframes grow-in { from { transform: scaleX(.04); opacity: .25; } to { transform: scaleX(1); opacity: 1; } }
+@media (max-width: 760px) {
+  .insights { grid-template-columns: 1fr; }
+  .chart-grid { grid-template-columns: 1fr; }
+  .wide-chart { grid-column: auto; }
+  .chart-card { padding: 12px; }
+  .data-chart { min-width: 540px; }
+  .chart-viewport { overflow-x: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+}
 """
 
 PLACEHOLDER = (
@@ -603,17 +907,7 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 results_out = gr.HTML(PLACEHOLDER)
 
             with gr.Tab("Benchmarks"):
-                gr.Markdown("### Test-set comparison")
                 gr.HTML(render_benchmark())
-                for filename, label in [
-                    ("pareto.png", "Quality vs latency (Pareto)"),
-                    ("ablations_negatives.png", "Hard vs random negatives"),
-                    ("ablations_rerank_depth.png", "Cross-encoder candidate depth"),
-                    ("ablations_query_length.png", "Query-length analysis"),
-                ]:
-                    path = RESULTS_DIR / filename
-                    if path.is_file():
-                        gr.Image(value=str(path), label=label, interactive=False)
 
             with gr.Tab("How it works"):
                 gr.Markdown(HOW_IT_WORKS)
