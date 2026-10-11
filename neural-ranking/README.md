@@ -50,9 +50,31 @@ python scripts/prepare_data.py --config configs/config.yaml --output_dir data/pr
 
 Generated data, model checkpoints, runs, and result files are ignored by Git. Keep them in Colab/Drive or copy them into the matching local directories before running downstream steps.
 
+### Restoring files from Google Drive
+
+The saved `neural-ranking-output/` bundle contains model checkpoints, cached
+embeddings, runs, and results, but it may not contain the prepared dataset.
+Mount Drive and copy the bundle contents into `artifacts/` from the project
+directory:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+```bash
+%cd /content/IR_PROJECT/neural-ranking
+!mkdir -p artifacts
+!cp -a "/content/drive/MyDrive/IR_PROJECT/neural-ranking-output/." artifacts/
+```
+
+If `data/processed/` is missing, prepare it separately with the command above
+or restore that folder from wherever it was saved. The output bundle is not a
+replacement for the corpus, query splits, qrels, or training triplets.
+
 ## Reproduce all results
 
-All commands below are run from `neural-ranking/` after data preparation. Training, corpus embedding, cross-encoder reranking, the full comparison, and the model-backed demo require the corresponding checkpoints; use a Colab GPU for those stages.
+All commands below are run from `neural-ranking/` after data preparation. Training, corpus embedding, cross-encoder reranking, and the full comparison require a CUDA-enabled runtime for the intended workflow. The model-backed demo requires the corpus and all model checkpoints; a GPU is recommended for responsive inference.
 
 ### 1. Lexical baselines
 
@@ -203,11 +225,42 @@ Query-length analysis (test split):
 
 ## Gradio demo
 
-[`app/demo.py`](app/demo.py) is a Gradio Blocks application comparing BM25 top-10 with BM25 top-100 followed by cross-encoder reranking. It loads the corpus, lexical index, bi-encoder/cached embeddings, and cross-encoder once at startup; then displays rank, PID, score, a short passage excerpt, and per-column latency. Copy the trained checkpoints and bi-encoder embedding cache into `artifacts/`, install dependencies, and launch from this directory:
+[`app/demo.py`](app/demo.py) is a Gradio Blocks search and evaluation dashboard.
+It loads the corpus, cached lexical indexes, bi-encoder and embeddings, and
+cross-encoder once at startup. On the Search tab, compare one or more of
+TF-IDF, BM25, bi-encoder, and BM25 → cross-encoder. Result cards show rank,
+PID, score, a passage excerpt, query-term highlights, and rank movement
+relative to BM25. Settings control the systems, number of results, and
+cross-encoder candidate depth. Summary tiles, a BM25/cross-encoder overlap
+donut, and latency bars help explain how the rankings differ.
+
+The Benchmarks tab renders the evaluation table and responsive inline SVG
+charts for quality versus latency and the three ablation studies. The SVG
+charts scale with the page, show exact point values on hover, and replace the
+previous static PNG display. The ablation charts are shown when
+`artifacts/results/ablations.md` is present; comparison metrics are read from
+`artifacts/results/comparison_table.csv` (with documented values as fallback).
+The How it works tab explains the rankers and metrics.
+
+After restoring the checkpoints, embedding cache, and prepared corpus, launch
+from this directory:
 
 ```bash
 python app/demo.py
 ```
+
+In Colab, the app detects the runtime and creates a `gradio.live` share URL
+automatically. Open that URL from the cell output; `127.0.0.1:7860` refers to
+the Colab VM and is not reachable from your local browser. To explicitly
+request a share URL outside Colab, run:
+
+```bash
+python app/demo.py --share
+```
+
+Share URLs are publicly accessible while active; do not use them for private
+data. To choose a different local port, pass `--port`, for example
+`python app/demo.py --port 7861`.
 
 The example queries were selected from the test run by maximizing disagreement
 between BM25 and cross-encoder top-3 results (zero overlapping PIDs; multiple
