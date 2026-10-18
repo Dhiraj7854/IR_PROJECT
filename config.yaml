@@ -1,4 +1,25 @@
+paths:
+  plant1_generation: data/raw/Plant_1_Generation_Data.csv
+  plant1_weather: data/raw/Plant_1_Weather_Sensor_Data.csv
+  plant2_generation: data/raw/Plant_2_Generation_Data.csv
+  plant2_weather: data/raw/Plant_2_Weather_Sensor_Data.csv
+  processed_dir: data/processed
+  results_dir: results
 forecast:
+  history_steps: 192
+  horizon_steps: 96
+  train_ratio: 0.70
+  validation_ratio: 0.15
+  feature_columns:
+    - AC_POWER
+    - DC_POWER
+    - AMBIENT_TEMPERATURE
+    - MODULE_TEMPERATURE
+    - IRRADIATION
+    - sin_tod
+    - cos_tod
+    - sin_dow
+    - cos_dow
   latitude: 15.35
   longitude: 75.16
   timezone: Asia/Kolkata
@@ -8,6 +29,13 @@ forecast:
   learning_rate: 0.001
   early_stopping_patience: 3
   interval_coverage: 0.90
+  dropout_rate: 0.2
+  weight_decay: 0.00001
+  scheduler_factor: 0.5
+  scheduler_patience: 2
+  conv_channels: [64, 128, 128]
+  dense_width: 256
+  kernel_size: 3
 game:
   num_prosumers: 100
   grid_price: 0.22
@@ -35,3 +63,15 @@ experiment:
   shock_duration_hours: 6
   shock_drop_fraction: 0.75
   shock_recovery_fraction: 0.95
+  sensitivity_values:
+    c_imb: [0.04, 0.08, 0.12]
+    platform_fee: [0.0, 0.02, 0.04]
+    n0: [4.0, 8.0, 16.0]
+    c_tx: [0.005, 0.01, 0.015]
+    num_prosumers: [50, 100, 200]
+    beta: [0.25, 0.5, 0.75]
+    eta: [0.5, 1.0, 2.0]
+  lhs_samples: 12
+  lhs_lower_factor: 0.5
+  lhs_upper_factor: 1.5
+  lhs_population_upper_factor: 2.0

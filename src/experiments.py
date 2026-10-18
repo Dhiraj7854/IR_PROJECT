@@ -282,6 +282,7 @@ def _value_of_information_by_day(payoff, data, load_mean, load_actual, kappas):
 
 def _sensitivity_analysis(data, config, dates):
     game = config["game"]
+    sensitivity_config = config["experiment"]["sensitivity_values"]
     seed = config["experiment"]["random_seed"]
     baseline = {
         "c_imb": game["imbalance_cost"],
@@ -292,15 +293,7 @@ def _sensitivity_analysis(data, config, dates):
         "beta": game["replicator_beta"],
         "eta": game["replicator_eta"],
     }
-    values = {
-        "c_imb": [0.5 * baseline["c_imb"], baseline["c_imb"], 1.5 * baseline["c_imb"]],
-        "platform_fee": [0.0, baseline["platform_fee"], 2.0 * baseline["platform_fee"]],
-        "n0": [0.5 * baseline["n0"], baseline["n0"], 2.0 * baseline["n0"]],
-        "c_tx": [0.5 * baseline["c_tx"], baseline["c_tx"], 1.5 * baseline["c_tx"]],
-        "num_prosumers": [50, baseline["num_prosumers"], 200],
-        "beta": [0.25, baseline["beta"], 0.75],
-        "eta": [0.5 * baseline["eta"], baseline["eta"], 2.0 * baseline["eta"]],
-    }
+    values = sensitivity_config
     records = []
 
     def evaluate(parameter, value, override_lhs=None):
@@ -372,10 +365,22 @@ def _sensitivity_analysis(data, config, dates):
             evaluate(parameter, value)
 
     dimensions = ["c_imb", "platform_fee", "n0", "c_tx", "num_prosumers", "beta", "eta"]
-    lower = np.array([0.5 * baseline[name] if name != "num_prosumers" else 50 for name in dimensions])
-    upper = np.array([1.5 * baseline[name] if name != "num_prosumers" else 200 for name in dimensions])
+    lower = np.array([
+        baseline[name] * config["experiment"]["lhs_lower_factor"]
+        for name in dimensions
+    ])
+    upper = np.array([
+        baseline[name] * config["experiment"]["lhs_upper_factor"]
+        for name in dimensions
+    ])
+    upper[dimensions.index("num_prosumers")] = (
+        baseline["num_prosumers"]
+        * config["experiment"]["lhs_population_upper_factor"]
+    )
     sampler = qmc.LatinHypercube(d=len(dimensions), seed=seed)
-    lhs = qmc.scale(sampler.random(n=12), lower, upper)
+    lhs = qmc.scale(
+        sampler.random(n=config["experiment"]["lhs_samples"]), lower, upper,
+    )
     for index, sample in enumerate(lhs):
         sample_values = dict(zip(dimensions, sample))
         payoff_override = {
@@ -402,6 +407,10 @@ def _weather_shock_analysis(payoff, data, load_mean, load_actual, dates, config)
         payoff, base_provider, data, load_mean, load_actual, dates,
         config, experiment["x0"],
     )
+    normalization_bill = float(np.mean([
+        abs(payoff.daily_hoard_bill(data["actual"][day], load_actual[day]))
+        for day in range(len(dates))
+    ]))
     shock_day = min(experiment["shock_day_index"], len(dates) - 1)
     start = int(experiment["shock_start_hour"] / game["interval_hours"])
     duration = int(experiment["shock_duration_hours"] / game["interval_hours"])
@@ -433,13 +442,22 @@ def _weather_shock_analysis(payoff, data, load_mean, load_actual, dates, config)
             timestamps=dates,
             x0=experiment["x0"],
             commitment="aware",
+            normalization_bill=normalization_bill,
         )
         pre_share = float(normal_trace["x_share"].iloc[max(shock_day - 1, 0)])
-        threshold = pre_share * experiment["shock_recovery_fraction"]
-        recovery = next(
-            (day - shock_day for day in range(shock_day + 1, len(trace))
-             if trace["x_share"].iloc[day] >= threshold),
-            np.nan,
+        normal_shock_day_share = float(normal_trace["x_share"].iloc[shock_day])
+        shock_day_share = float(trace["x_share"].iloc[shock_day])
+        has_share_deviation = not np.isclose(
+            shock_day_share, normal_shock_day_share, rtol=0.0, atol=1e-12,
+        )
+        threshold = normal_shock_day_share * experiment["shock_recovery_fraction"]
+        recovery = (
+            next(
+                (day - shock_day for day in range(shock_day + 1, len(trace))
+                 if trace["x_share"].iloc[day] >= threshold),
+                np.nan,
+            )
+            if has_share_deviation else 0
         )
         rows.append({
             "shock_visibility": "forecast_visible" if visible else "actual_only_unforecast",
@@ -448,7 +466,10 @@ def _weather_shock_analysis(payoff, data, load_mean, load_actual, dates, config)
             "shock_duration_hours": experiment["shock_duration_hours"],
             "generation_drop_fraction": experiment["shock_drop_fraction"],
             "pre_shock_share": pre_share,
-            "minimum_share": float(trace["x_share"].min()),
+            "normal_share_after_shock_day": normal_shock_day_share,
+            "share_after_shock_day": shock_day_share,
+            "shock_day_share_difference": shock_day_share - normal_shock_day_share,
+            "minimum_share_from_shock_day": float(trace["x_share"].iloc[shock_day:].min()),
             "final_share": summary["Final_Share"],
             "lost_trade_kWh": max(
                 normal_summary["Total_Matched_Trade_kWh"] - summary["Total_Matched_Trade_kWh"],
@@ -467,7 +488,12 @@ def _weather_shock_analysis(payoff, data, load_mean, load_actual, dates, config)
                 - normal_summary["Total_Sharing_Bill_Per_Household ($)"]
             ) / max(abs(normal_summary["Total_Hoard_Bill_Per_Household ($)"]), 1e-12) * 100.0,
             "recovery_days": recovery,
-            "recovery_status": "recovered" if np.isfinite(recovery) else "not_recovered_in_observed_period",
+            "recovery_status": (
+                "no_share_deviation"
+                if not has_share_deviation
+                else "recovered" if np.isfinite(recovery)
+                else "not_recovered_in_observed_period"
+            ),
         })
         traces.append(trace.assign(
             scenario="forecast_visible" if visible else "actual_only_unforecast"

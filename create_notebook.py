@@ -140,8 +140,8 @@ print(f"PyTorch version: {torch.__version__} | Execution Device: {device}")
 We parse timestamps (`%d-%m-%Y %H:%M` for generation, `%Y-%m-%d %H:%M:%S` for weather sensors), aggregate 22 inverters to total plant AC/DC power, impute physical nighttime zeros, and construct a continuous 15-minute grid.
 """))
 
-    cells.append(nbf.v4.new_code_cell("""p1_gen_file = 'Plant_1_Generation_Data.csv'
-p1_weather_file = 'Plant_1_Weather_Sensor_Data.csv'
+    cells.append(nbf.v4.new_code_cell("""p1_gen_file = 'data/raw/Plant_1_Generation_Data.csv'
+p1_weather_file = 'data/raw/Plant_1_Weather_Sensor_Data.csv'
 
 df_p1 = load_and_clean_plant_data(p1_gen_file, p1_weather_file, is_plant1=True)
 print(f"Cleaned Plant 1 Time Series: {len(df_p1)} intervals (34 days)")
@@ -402,8 +402,8 @@ plt.show()
 To verify the external validity of the 1D-CNN architecture, we evaluate the Plant 1-trained model directly on Plant 2 generation and weather data without retraining (zero-shot transfer).
 """))
 
-    cells.append(nbf.v4.new_code_cell("""p2_gen_file = 'Plant_2_Generation_Data.csv'
-p2_weather_file = 'Plant_2_Weather_Sensor_Data.csv'
+    cells.append(nbf.v4.new_code_cell("""p2_gen_file = 'data/raw/Plant_2_Generation_Data.csv'
+p2_weather_file = 'data/raw/Plant_2_Weather_Sensor_Data.csv'
 
 df_p2 = load_and_clean_plant_data(p2_gen_file, p2_weather_file, is_plant1=False)
 data_dict_p2 = prepare_chronological_splits(df_p2, feature_cols, history_len=192, horizon_len=96)

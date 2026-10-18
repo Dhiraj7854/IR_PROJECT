@@ -1,6 +1,7 @@
 import numpy as np
 
 from src.payoffs_v2 import ForecastAwarePayoffs
+from src.payoffs import ProsumerCommunity
 from src.replicator import DailyReplicator
 
 
@@ -121,3 +122,47 @@ def test_daily_replicator_keeps_share_inside_unit_interval():
 
     assert np.all((trace["x_share"] >= 1e-3) & (trace["x_share"] <= 1.0 - 1e-3))
     assert np.all(np.abs(trace["dx"]) <= 0.1 + 1e-12)
+
+
+def test_unforecast_actual_shock_changes_settlement_not_forecast_based_strategy():
+    model = make_payoff_model()
+    forecast, actual, sigma, loads = make_market_inputs(days=2)
+    shock_actual = actual.copy()
+    shock_actual[1, 40:64] *= 0.25
+    replicator = DailyReplicator()
+    bill_scale = np.mean([
+        abs(model.daily_hoard_bill(actual[day], loads[day]))
+        for day in range(2)
+    ])
+    kwargs = {
+        "payoff_model": model,
+        "generation_forecast_kw": forecast,
+        "sigma_forecast_kw": sigma,
+        "load_mean_kw": loads,
+        "load_actual_kw": loads,
+        "normalization_bill": bill_scale,
+    }
+
+    normal_trace, _ = replicator.simulate(
+        generation_actual_kw=actual, **kwargs,
+    )
+    shock_trace, shock_summary = replicator.simulate(
+        generation_actual_kw=shock_actual, **kwargs,
+    )
+
+    assert np.allclose(normal_trace["x_share"], shock_trace["x_share"])
+    assert not np.isclose(
+        normal_trace["bill_savings"].sum(),
+        shock_trace["bill_savings"].sum(),
+    )
+
+
+def test_legacy_community_does_not_reseed_global_numpy_rng():
+    state = np.random.get_state()
+    expected = np.random.random()
+    np.random.set_state(state)
+
+    ProsumerCommunity(num_prosumers=5, seed=99)
+    actual = np.random.random()
+
+    assert actual == expected

@@ -201,7 +201,11 @@ def prepare_chronological_splits(df, feature_cols, target_col='AC_POWER', histor
 
 if __name__ == '__main__':
     print("Testing preprocess module...")
-    df_p1 = load_and_clean_plant_data('Plant_1_Generation_Data.csv', 'Plant_1_Weather_Sensor_Data.csv', is_plant1=True)
+    df_p1 = load_and_clean_plant_data(
+        'data/raw/Plant_1_Generation_Data.csv',
+        'data/raw/Plant_1_Weather_Sensor_Data.csv',
+        is_plant1=True,
+    )
     print(f"Loaded Plant 1: {len(df_p1)} intervals ({df_p1['DATE_TIME'].min()} to {df_p1['DATE_TIME'].max()})")
     
     feature_cols = ['AC_POWER', 'DC_POWER', 'AMBIENT_TEMPERATURE', 'MODULE_TEMPERATURE', 'IRRADIATION',

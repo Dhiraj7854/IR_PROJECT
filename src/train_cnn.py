@@ -21,41 +21,46 @@ class Conv1DForecaster(nn.Module):
     compatible with Monte Carlo Dropout uncertainty estimation.
     """
     def __init__(self, in_channels=9, seq_len=192, horizon=96, dropout_rate=0.2,
-                 future_features=0, predict_residual=False):
+                 future_features=0, predict_residual=False,
+                 conv_channels=(64, 128, 128), dense_width=256, kernel_size=3):
         super().__init__()
+        if len(conv_channels) != 3 or any(channel <= 0 for channel in conv_channels):
+            raise ValueError("conv_channels must contain three positive widths")
+        if seq_len % 4 != 0 or kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("seq_len must be divisible by 4 and kernel_size must be odd")
         self.dropout_rate = dropout_rate
         self.future_features = future_features
         self.predict_residual = predict_residual
 
         self.conv_stack = nn.Sequential(
             # Block 1
-            nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(in_channels, conv_channels[0], kernel_size=kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm1d(conv_channels[0]),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
 
             # Block 2
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(conv_channels[0], conv_channels[1], kernel_size=kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm1d(conv_channels[1]),
             nn.ReLU(),
             nn.MaxPool1d(2),
             nn.Dropout(dropout_rate),
 
             # Block 3
-            nn.Conv1d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(conv_channels[1], conv_channels[2], kernel_size=kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm1d(conv_channels[2]),
             nn.ReLU(),
             nn.MaxPool1d(2),
             nn.Dropout(dropout_rate),
         )
 
         # 192 / 4 = 48 feature maps of length 48
-        self.flatten_dim = 128 * 48
+        self.flatten_dim = conv_channels[2] * (seq_len // 4)
         self.fc_head = nn.Sequential(
-            nn.Linear(self.flatten_dim + horizon * future_features, 256),
+            nn.Linear(self.flatten_dim + horizon * future_features, dense_width),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, horizon)
+            nn.Linear(dense_width, horizon)
         )
 
     def forward(self, x, future_covariates=None, persistence=None):
@@ -75,14 +80,18 @@ class Conv1DForecaster(nn.Module):
         return out
 
 
-def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu', patience=5):
+def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu',
+                patience=5, weight_decay=1e-5, scheduler_factor=0.5,
+                scheduler_patience=2):
     """
     Trains the 1D-CNN model with Huber Loss, Adam optimizer, LR scheduling and Early Stopping.
     """
     model.to(device)
     criterion = nn.SmoothL1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=scheduler_factor, patience=scheduler_patience,
+    )
 
     best_val_loss = float('inf')
     best_weights = None

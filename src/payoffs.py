@@ -22,16 +22,16 @@ class ProsumerCommunity:
         self.c_tx = c_tx        # Platform transaction fee ($/kWh)
         self.plant_capacity = plant_capacity_kw
 
-        np.random.seed(seed)
+        self.rng = np.random.default_rng(seed)
         # Scaled community capacity: ~500 kW peak community solar (~5 kW per household)
         self.comm_scale_factor = 500.0 / plant_capacity_kw
 
         # Heterogeneous solar share allocations (Dirichlet distribution)
-        alpha = np.random.uniform(0.6, 1.4, size=num_prosumers)
+        alpha = self.rng.uniform(0.6, 1.4, size=num_prosumers)
         self.solar_weights = alpha / np.sum(alpha)
 
         # Heterogeneous base demand levels (mean 1.8 kW per household, peak ~3.5 kW)
-        self.demand_multipliers = np.random.uniform(0.6, 1.5, size=num_prosumers)
+        self.demand_multipliers = self.rng.uniform(0.6, 1.5, size=num_prosumers)
 
     def generate_diurnal_load(self, timestamps):
         """
@@ -48,7 +48,7 @@ class ProsumerCommunity:
         # Expand to (T, num_prosumers) with household heterogeneity
         loads = np.outer(base_curve, self.demand_multipliers)
         # Add stochastic household noise
-        noise = np.random.normal(0, 0.08, size=loads.shape)
+        noise = self.rng.normal(0, 0.08, size=loads.shape)
         loads = np.clip(loads + noise, 0.3, None)
         return loads
 

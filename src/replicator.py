@@ -147,6 +147,7 @@ class DailyReplicator:
         timestamps=None,
         x0=0.5,
         commitment="aware",
+        normalization_bill=None,
     ):
         forecasts = np.asarray(generation_forecast_kw, dtype=float)
         actuals = np.asarray(generation_actual_kw, dtype=float)
@@ -168,7 +169,10 @@ class DailyReplicator:
             payoff_model.daily_hoard_bill(actuals[day], load_actual_kw[day])
             for day in range(days)
         ])
-        bill_scale = float(np.mean(np.abs(hoard_bills)))
+        bill_scale = (
+            float(np.mean(np.abs(hoard_bills)))
+            if normalization_bill is None else float(normalization_bill)
+        )
         if not np.isfinite(bill_scale) or bill_scale <= 1e-12:
             raise ValueError("Mean absolute daily hoard bill must be positive")
 
