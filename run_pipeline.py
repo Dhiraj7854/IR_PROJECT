@@ -1,20 +1,14 @@
 """
 run_pipeline.py
 Master execution script running the full end-to-end pipeline:
-1. Data Ingestion & Preprocessing (Plant 1 + Plant 2)
+1. Data Ingestion & Preprocessing
 2. Chronological Splitting & Windowing (192-step history -> 96-step forecast)
-3. 1D-CNN Model Training with Huber Loss & Early Stopping
-4. Persistence Baseline & Forecast Accuracy Evaluation (MAE, RMSE, nMAE, Daylight metrics)
-5. Monte Carlo Dropout Uncertainty Quantification (PICP, MPIW, Prediction Intervals)
-6. Dynamic Payoffs and Replicator Dynamics Simulation (M0, M1, M2, M3)
-7. Uncertainty Sensitivity & Tipping Point Sweep
-8. Weather Shock Response & Behavioral Resilience
-9. Cross-Plant Generalization Test (Plant 2)
-10. Publication-Quality Figures & CSV Summary Tables Export
+3. Five-seed CNN training and persistence skill evaluation
+4. Validation-calibrated split-conformal forecast intervals
+5. Rolling day-ahead forecast archive
+6. Forecast-provider evolutionary game, equilibrium, sensitivity, and shock analyses
 """
 
-import os
-import sys
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
@@ -27,13 +21,8 @@ from src.train_cnn import (Conv1DForecaster, train_model, compute_forecast_metri
                            persistence_baseline)
 from src.uncertainty import (calibrate_conformal_half_width, compute_conformal_intervals,
                              evaluate_probabilistic_by_lead)
-from src.payoffs import ProsumerCommunity
-from src.replicator import ReplicatorEngine
-from src.experiments import (run_comparative_experiment, run_uncertainty_sweep,
-                             run_weather_shock_experiment, plot_forecast_actual_vs_pred,
-                             plot_error_by_horizon, plot_uncertainty_calibration,
-                             plot_comparative_trajectories, plot_tipping_point,
-                             plot_weather_shock_response)
+from src.experiments import (plot_error_by_horizon, plot_forecast_actual_vs_pred,
+                             plot_uncertainty_calibration, run_research_experiments)
 
 
 def main():
@@ -42,7 +31,7 @@ def main():
 
     print("=" * 80)
     print("FORECAST-AWARE EVOLUTIONARY GAME THEORY PIPELINE")
-    print("1D-CNN Solar Forecasting + MC Dropout + Dynamic Replicator Dynamics")
+    print("Five-seed CNN Forecasting + Conformal Intervals + Daily Evolutionary Game")
     print("=" * 80)
 
     # Device
@@ -52,8 +41,6 @@ def main():
     # Paths
     p1_gen_path = 'Plant_1_Generation_Data.csv'
     p1_weather_path = 'Plant_1_Weather_Sensor_Data.csv'
-    p2_gen_path = 'Plant_2_Generation_Data.csv'
-    p2_weather_path = 'Plant_2_Weather_Sensor_Data.csv'
 
     # Step 1: Preprocessing Plant 1
     print("\n--- STEP 1: Data Ingestion & Preprocessing (Plant 1) ---")
@@ -284,126 +271,13 @@ def main():
     )
     print(f"Saved {len(rolling)} rolling 00:00 day-ahead forecasts.")
 
-    # Step 6: Evolutionary Game & Replicator Dynamics (M0, M1, M2, M3)
-    print("\n--- STEP 6: Dynamic Evolutionary Game & Replicator Dynamics ---")
-    community = ProsumerCommunity(num_prosumers=100, plant_capacity_kw=rated_capacity, p_grid=0.22, p_fit=0.06, c_tx=0.01)
-    
-    # Flatten test timestamps (using 1st step of each consecutive window)
-    test_dates_flat = pd.to_datetime(dates_test[:, 0])
-    
-    models_dict = run_comparative_experiment(
-        community,
-        test_dates=test_dates_flat,
-        y_true=y_test_unscaled,
-        y_cnn=mean_pred,
-        sigma_cnn=std_pred,
-        y_persist=y_persist,
-        x0=0.50,
-        lambda_s=2.5
+    print("\n--- STEP 6: Forecast-provider evolutionary game and scenario analyses ---")
+    run_research_experiments(
+        forecast_path="data/processed/day_ahead_forecasts.npz",
+        cleaned_path="data/processed/plant_1_cleaned.csv",
+        config=config,
     )
-
-    # Comparison Table
-    summary_rows = []
-    for name, (df_sim, summary) in models_dict.items():
-        summary['Model'] = name
-        summary_rows.append(summary)
-        # Save individual simulation trace
-        clean_name = name.split(' ')[0].replace('(', '').replace(')', '')
-        df_sim.to_csv(f'results/tables/simulation_{clean_name}.csv', index=False)
-
-    summary_df = pd.DataFrame(summary_rows)
-    cols_order = ['Model', 'Final_Share', 'Mean_Share', 'Time_Above_Threshold',
-                  'Total_P2P_Traded_kWh', 'Total_Cost ($)', 'Total_Savings ($)', 'Savings_Pct (%)']
-    print("\nEvolutionary Game Model Comparison:")
-    print(summary_df[cols_order].to_string(index=False))
-    summary_df[cols_order].to_csv('results/tables/table_3_model_comparison.csv', index=False)
-
-    # Figure 4: Comparative Trajectories
-    plot_comparative_trajectories(models_dict, save_path='results/figures/figure_4_comparative_trajectories.png')
-    print("Saved Figure 4: Comparative evolutionary trajectories")
-
-    # Step 7: Uncertainty Sensitivity & Tipping Point Analysis
-    print("\n--- STEP 7: Sensitivity & Critical Tipping Point Sweep ---")
-    loads = community.generate_diurnal_load(test_dates_flat)
-    gen_cnn = mean_pred[:, 0]
-    sigma_cnn = std_pred[:, 0]
-
-    sweep_df, _ = run_uncertainty_sweep(
-        community, test_dates=test_dates_flat,
-        gen_series=gen_cnn, sigma_series=sigma_cnn,
-        loads=loads, x0=0.50, lambda_s=2.5,
-        multipliers=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
-    )
-    print("\nUncertainty Sweep Results:")
-    print(sweep_df[['Uncertainty_Multiplier', 'Uncertainty_Scale_Pct', 'Final_Share', 'Community_Savings ($)']].to_string(index=False))
-    sweep_df.to_csv('results/tables/table_4_tipping_point_sweep.csv', index=False)
-
-    plot_tipping_point(sweep_df, save_path='results/figures/figure_5_tipping_point.png')
-    print("Saved Figure 5: Bifurcation and tipping point curves")
-
-    # Step 8: Weather Shock Response
-    print("\n--- STEP 8: Weather Shock & Behavioral Resilience Experiment ---")
-    df_normal, df_shock, shock_metrics, shock_range = run_weather_shock_experiment(
-        community, test_dates=test_dates_flat,
-        gen_series=gen_cnn, sigma_series=sigma_cnn,
-        loads=loads, x0=0.85, lambda_s=2.5,
-        shock_start_idx=96, shock_duration=24, shock_drop=0.75
-    )
-    print("\nWeather Shock Response Metrics:")
-    for k, v in shock_metrics.items():
-        print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
-
-    pd.DataFrame([shock_metrics]).to_csv('results/tables/table_5_weather_shock_metrics.csv', index=False)
-    plot_weather_shock_response(df_normal, df_shock, shock_range, save_path='results/figures/figure_6_weather_shock.png')
-    print("Saved Figure 6: Weather shock response and recovery dynamics")
-
-    # Step 9: Cross-Plant Generalization Test (Plant 2)
-    print("\n--- STEP 9: Cross-Plant Generalization Test (Plant 2) ---")
-    df_p2 = load_and_clean_plant_data(p2_gen_path, p2_weather_path, is_plant1=False)
-    print(f"Loaded Plant 2: {len(df_p2)} intervals")
-    df_p2.to_csv('data/processed/plant_2_cleaned.csv', index=False)
-
-    # Use Plant 1 scalers to evaluate zero-shot transfer
-    data_dict_p2 = prepare_chronological_splits(df_p2, feature_cols, history_len=192, horizon_len=96)
-    X_test_p2, y_test_p2, dates_test_p2 = data_dict_p2['test']
-    y_test_p2_unscaled = y_test_p2 * data_dict_p2['scalers']['target_std'] + data_dict_p2['scalers']['target_mean']
-    p2_raw = data_dict_p2['scalers']['feature_scaler'].inverse_transform(
-        X_test_p2.reshape(-1, len(feature_cols))
-    ).reshape(X_test_p2.shape)
-    X_test_p2_model = scalers['feature_scaler'].transform(
-        p2_raw.reshape(-1, len(feature_cols))
-    ).reshape(p2_raw.shape).astype(np.float32)
-    future_test_p2 = make_future_covariates(dates_test_p2, latitude, longitude, timezone)
-    persistence_p2_scaled = X_test_p2_model[:, -96:, target_index]
-    test_tensor_p2 = torch.tensor(X_test_p2_model, dtype=torch.float32)
-    p2_forecasts = []
-    with torch.no_grad():
-        for member in models:
-            member.eval()
-            if selected_name == 'future_covariate_residual_cnn':
-                p2_pred_scaled = member(
-                    test_tensor_p2.to(device),
-                    torch.tensor(future_test_p2, dtype=torch.float32, device=device),
-                    torch.tensor(persistence_p2_scaled, dtype=torch.float32, device=device),
-                ).cpu().numpy()
-            else:
-                p2_pred_scaled = member(test_tensor_p2.to(device)).cpu().numpy()
-            p2_forecasts.append(p2_pred_scaled)
-    p2_pred_unscaled = np.clip(
-        np.mean(p2_forecasts, axis=0) * scalers['target_std'] + scalers['target_mean'],
-        0.0, None,
-    )
-
-    metrics_p2 = compute_forecast_metrics(y_test_p2_unscaled, p2_pred_unscaled, data_dict_p2['scalers']['rated_capacity'], name="Plant 2 Transfer Test")
-    print(f"Plant 2 Zero-Shot Transfer: MAE = {metrics_p2['MAE (kW)']:.2f} kW | nMAE = {metrics_p2['nMAE (%)']:.2f}%")
-    pd.DataFrame([metrics_p2])[display_cols].to_csv('results/tables/table_6_plant2_generalization.csv', index=False)
-
-    print("\n" + "=" * 80)
-    print("ALL EXPERIMENTS COMPLETED SUCCESSFULLY!")
-    print("Generated Artifacts:")
-    print("  Figures: results/figures/ (Figures 1 to 6)")
-    print("  Tables:  results/tables/  (Tables 1 to 6)")
-    print("=" * 80)
+    print("\nAll forecasting and research experiments completed.")
 
 
 if __name__ == '__main__':

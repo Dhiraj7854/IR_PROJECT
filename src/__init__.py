@@ -7,9 +7,6 @@ from .uncertainty import (predict_mc_dropout, compute_prediction_intervals,
                           evaluate_uncertainty_calibration, calibrate_conformal_half_width,
                           compute_conformal_intervals, evaluate_probabilistic_by_lead)
 from .payoffs import ProsumerCommunity
-from .replicator import ReplicatorEngine
-from .experiments import (run_comparative_experiment, run_uncertainty_sweep,
-                           run_weather_shock_experiment, plot_forecast_actual_vs_pred,
-                           plot_error_by_horizon, plot_uncertainty_calibration,
-                           plot_comparative_trajectories, plot_tipping_point,
-                           plot_weather_shock_response)
+from .payoffs_v2 import ForecastAwarePayoffs
+from .replicator import DailyReplicator, ReplicatorEngine
+from .experiments import run_research_experiments

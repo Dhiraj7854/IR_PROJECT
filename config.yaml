@@ -21,3 +21,17 @@ game:
   replicator_beta: 0.5
   replicator_eta: 1.0
   max_share_step: 0.1
+experiment:
+  random_seed: 42
+  scenario_days: 200
+  block_length_days: 2
+  scenario_seeds: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
+  x0: 0.5
+  kappa_multipliers: [0.0, 0.5, 1.0, 1.5, 2.0]
+  equilibrium_grid_size: 101
+  equilibrium_epochs: 200
+  shock_day_index: 5
+  shock_start_hour: 12
+  shock_duration_hours: 6
+  shock_drop_fraction: 0.75
+  shock_recovery_fraction: 0.95

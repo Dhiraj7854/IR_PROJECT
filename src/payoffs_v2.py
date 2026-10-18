@@ -65,26 +65,54 @@ class ForecastAwarePayoffs:
     @staticmethod
     def expected_newsvendor_cost(sigma, c_u, c_o, z):
         """Expected overage and underage costs for a normal forecast error."""
-        if sigma < 0 or c_u < 0 or c_o < 0:
+        sigma = np.asarray(sigma, dtype=float)
+        c_u = np.asarray(c_u, dtype=float)
+        c_o = np.asarray(c_o, dtype=float)
+        z = np.asarray(z, dtype=float)
+        if np.any(sigma < 0) or np.any(c_u < 0) or np.any(c_o < 0):
             raise ValueError("Newsvendor inputs must be nonnegative")
-        if sigma == 0 or np.isinf(z):
-            return 0.0
-        phi = norm.pdf(z)
-        cdf = norm.cdf(z)
+        sigma, c_u, c_o, z = np.broadcast_arrays(sigma, c_u, c_o, z)
+        finite_z = np.isfinite(z)
+        safe_z = np.where(finite_z, z, 0.0)
+        phi = norm.pdf(safe_z)
+        cdf = norm.cdf(safe_z)
         expected_cost = sigma * (
-            c_o * (phi + z * cdf)
-            + c_u * (phi - z * (1.0 - cdf))
+            c_o * (phi + safe_z * cdf)
+            + c_u * (phi - safe_z * (1.0 - cdf))
         )
-        return float(max(expected_cost, 0.0))
+        expected_cost = np.where(finite_z, np.maximum(expected_cost, 0.0), 0.0)
+        return float(expected_cost) if expected_cost.ndim == 0 else expected_cost
 
-    def generate_diurnal_load(self, timestamps, rng=None):
-        """Generate one reproducible 15-minute load profile per household."""
-        rng = self.rng if rng is None else rng
+    @staticmethod
+    def _optimal_z_array(c_u, c_o):
+        ratio = np.divide(c_u, c_u + c_o, out=np.zeros_like(c_u), where=(c_u + c_o) > 0)
+        z = norm.ppf(ratio)
+        return np.where(c_u == 0.0, -np.inf, z)
+
+    @staticmethod
+    def _newsvendor_cost_array(sigma, c_u, c_o, z):
+        finite_z = np.isfinite(z)
+        safe_z = np.where(finite_z, z, 0.0)
+        phi = norm.pdf(safe_z)
+        cdf = norm.cdf(safe_z)
+        cost = sigma * (
+            c_o * (phi + safe_z * cdf)
+            + c_u * (phi - safe_z * (1.0 - cdf))
+        )
+        return np.where(finite_z, np.maximum(cost, 0.0), 0.0)
+
+    def expected_diurnal_load(self, timestamps):
+        """Return expected household loads without scenario noise."""
         hours = np.asarray([ts.hour + ts.minute / 60.0 for ts in timestamps])
         morning = 1.2 * np.exp(-((hours - 8.0) ** 2) / (2 * 1.5**2))
         evening = 2.2 * np.exp(-((hours - 19.5) ** 2) / (2 * 2.0**2))
         base = 0.8 + 0.3 * np.sin(np.pi * (hours - 6.0) / 12.0)
-        expected_kw = np.outer(base + morning + evening, self.demand_multipliers)
+        return np.outer(base + morning + evening, self.demand_multipliers)
+
+    def generate_diurnal_load(self, timestamps, rng=None):
+        """Generate one reproducible noisy 15-minute profile per household."""
+        rng = self.rng if rng is None else rng
+        expected_kw = self.expected_diurnal_load(timestamps)
         return np.clip(expected_kw + rng.normal(0.0, 0.08, expected_kw.shape), 0.3, None)
 
     def _load_matrix(self, loads_kw, steps, name):
@@ -112,11 +140,13 @@ class ForecastAwarePayoffs:
         if generation.ndim != 1 or not np.isfinite(generation).all() or np.any(generation < 0):
             raise ValueError("Actual generation must be a finite nonnegative 1D series")
         loads = self._load_matrix(load_actual_kw, len(generation), "load_actual_kw")
-        bills = np.zeros(self.num_prosumers)
-        for generation_t, loads_t in zip(generation, loads):
-            surplus, deficit = self._surplus_deficit_kwh(generation_t, loads_t)
-            bills += self.p_grid * deficit - self.p_fit * surplus
-        return float(np.mean(bills))
+        household_generation = (
+            generation[:, None] * self.community_scale_factor * self.solar_weights[None, :]
+        )
+        net = (household_generation - loads) * self.dt_hours
+        surplus = np.maximum(net, 0.0)
+        deficit = np.maximum(-net, 0.0)
+        return float(np.mean(np.sum(self.p_grid * deficit - self.p_fit * surplus, axis=0)))
 
     def calculate_day_payoffs(
         self,
@@ -156,106 +186,95 @@ class ForecastAwarePayoffs:
         n_s = max(x_share * self.num_prosumers, 1.0)
         thin_market_efficiency = float(-np.expm1(-n_s / self.n0))
 
-        total_gain = 0.0
-        naive_imbalance_cost = 0.0
-        aware_imbalance_cost = 0.0
-        newsvendor_naive_cost = 0.0
-        value_of_information = 0.0
-        realized_gain = 0.0
-        realized_imbalance = 0.0
-        matched_volume = 0.0
-        matched_sell_volume = 0.0
-        matched_buy_volume = 0.0
-        price_sum = 0.0
+        household_generation_forecast = (
+            forecast[:, None] * self.community_scale_factor * self.solar_weights[None, :]
+        )
+        forecast_net = (household_generation_forecast - mean_loads) * self.dt_hours
+        forecast_surplus = np.mean(np.maximum(forecast_net, 0.0), axis=1)
+        forecast_deficit = np.mean(np.maximum(-forecast_net, 0.0), axis=1)
+        s_pool = n_s * forecast_surplus
+        d_pool = n_s * forecast_deficit
+        sdr = s_pool / (d_pool + 1e-12)
+        price = np.clip(
+            self.p_fit + (self.p_grid - self.p_fit) / (1.0 + sdr),
+            self.p_fit + self.c_tx,
+            self.p_grid - self.c_tx,
+        )
+        rho_s = np.divide(
+            d_pool, s_pool, out=np.zeros_like(s_pool), where=s_pool > 0
+        ).clip(max=1.0)
+        rho_d = np.divide(
+            s_pool, d_pool, out=np.zeros_like(d_pool), where=d_pool > 0
+        ).clip(max=1.0)
+        gain = thin_market_efficiency * (
+            rho_s * forecast_surplus * (price - self.c_tx - self.p_fit)
+            + rho_d * forecast_deficit * (self.p_grid - price - self.c_tx)
+        )
+        sigma_sol = sigma * self.community_scale_factor / self.num_prosumers * self.dt_hours
+        sigma_e = np.sqrt(sigma_sol**2 + self.sigma_load_kwh**2 / n_s)
+        c_u_seller = np.maximum(price - self.c_tx - self.p_fit, 0.0)
+        c_u_buyer = np.maximum(self.p_grid - price - self.c_tx, 0.0)
+        z_seller = self._optimal_z_array(c_u_seller, np.full(steps, self.c_imb))
+        z_buyer = self._optimal_z_array(c_u_buyer, np.full(steps, self.c_imb))
+        naive_seller_cost = self._newsvendor_cost_array(
+            sigma_e, c_u_seller, np.full(steps, self.c_imb), np.zeros(steps)
+        )
+        naive_buyer_cost = self._newsvendor_cost_array(
+            sigma_e, c_u_buyer, np.full(steps, self.c_imb), np.zeros(steps)
+        )
+        aware_seller_cost = self._newsvendor_cost_array(
+            sigma_e, c_u_seller, np.full(steps, self.c_imb), z_seller
+        )
+        aware_buyer_cost = self._newsvendor_cost_array(
+            sigma_e, c_u_buyer, np.full(steps, self.c_imb), z_buyer
+        )
+        newsvendor_naive_cost = float(np.sum(naive_seller_cost + naive_buyer_cost))
+        aware_imbalance_cost = float(np.sum(aware_seller_cost + aware_buyer_cost))
+        value_of_information = float(np.sum(np.maximum(
+            naive_seller_cost + naive_buyer_cost
+            - aware_seller_cost - aware_buyer_cost,
+            0.0,
+        )))
+        naive_imbalance_cost = float(np.sum(
+            self.c_imb * sigma_e * np.sqrt(2.0 / np.pi)
+        ))
+        if commitment == "aware":
+            q_seller = np.where(
+                sigma_e == 0.0,
+                forecast_surplus,
+                np.maximum(forecast_surplus + z_seller * sigma_e, 0.0),
+            )
+            q_buyer = np.where(
+                sigma_e == 0.0,
+                forecast_deficit,
+                np.maximum(forecast_deficit + z_buyer * sigma_e, 0.0),
+            )
+        else:
+            q_seller = forecast_surplus
+            q_buyer = forecast_deficit
 
-        for forecast_t, actual_t, sigma_t, mean_load_t, actual_load_t in zip(
-            forecast, actual, sigma, mean_loads, actual_loads
-        ):
-            forecast_surplus, forecast_deficit = self._surplus_deficit_kwh(
-                forecast_t, mean_load_t
-            )
-            actual_surplus, actual_deficit = self._surplus_deficit_kwh(
-                actual_t, actual_load_t
-            )
-            s_hat = float(np.mean(forecast_surplus))
-            d_hat = float(np.mean(forecast_deficit))
-            s_pool = n_s * s_hat
-            d_pool = n_s * d_hat
-            sdr = s_pool / (d_pool + 1e-12)
-            raw_price = self.p_fit + (self.p_grid - self.p_fit) / (1.0 + sdr)
-            price = float(np.clip(
-                raw_price, self.p_fit + self.c_tx, self.p_grid - self.c_tx
-            ))
-            rho_s = min(1.0, d_pool / s_pool) if s_pool > 0 else 0.0
-            rho_d = min(1.0, s_pool / d_pool) if d_pool > 0 else 0.0
-            gain_t = thin_market_efficiency * (
-                rho_s * s_hat * (price - self.c_tx - self.p_fit)
-                + rho_d * d_hat * (self.p_grid - price - self.c_tx)
-            )
-            total_gain += gain_t
-
-            sigma_sol = sigma_t * self.community_scale_factor / self.num_prosumers * self.dt_hours
-            sigma_e = self.forecast_error_std(
-                sigma_sol, n_s, self.sigma_load_kwh
-            )
-            c_u_seller = max(price - self.c_tx - self.p_fit, 0.0)
-            c_u_buyer = max(self.p_grid - price - self.c_tx, 0.0)
-            z_seller = self.optimal_news_vendor_z(c_u_seller, self.c_imb)
-            z_buyer = self.optimal_news_vendor_z(c_u_buyer, self.c_imb)
-
-            cost_seller_naive = self.expected_newsvendor_cost(
-                sigma_e, c_u_seller, self.c_imb, 0.0
-            )
-            cost_buyer_naive = self.expected_newsvendor_cost(
-                sigma_e, c_u_buyer, self.c_imb, 0.0
-            )
-            cost_seller_aware = self.expected_newsvendor_cost(
-                sigma_e, c_u_seller, self.c_imb, z_seller
-            )
-            cost_buyer_aware = self.expected_newsvendor_cost(
-                sigma_e, c_u_buyer, self.c_imb, z_buyer
-            )
-            newsvendor_naive_cost += cost_seller_naive + cost_buyer_naive
-            aware_imbalance_cost += cost_seller_aware + cost_buyer_aware
-            value_of_information += max(
-                (cost_seller_naive + cost_buyer_naive)
-                - (cost_seller_aware + cost_buyer_aware),
-                0.0,
-            )
-            direct_imbalance = self.c_imb * sigma_e * np.sqrt(2.0 / np.pi)
-            naive_imbalance_cost += direct_imbalance
-
-            if commitment == "aware":
-                q_seller = (
-                    s_hat if sigma_e == 0.0
-                    else max(s_hat + z_seller * sigma_e, 0.0)
-                )
-                q_buyer = (
-                    d_hat if sigma_e == 0.0
-                    else max(d_hat + z_buyer * sigma_e, 0.0)
-                )
-                interval_cost = cost_seller_aware + cost_buyer_aware
-            else:
-                q_seller = s_hat
-                q_buyer = d_hat
-                interval_cost = direct_imbalance
-
-            actual_s = float(np.mean(actual_surplus))
-            actual_d = float(np.mean(actual_deficit))
-            available_sell = min(n_s * q_seller, n_s * actual_s)
-            available_buy = min(n_s * q_buyer, n_s * actual_d)
-            matched = thin_market_efficiency * min(available_sell, available_buy)
-            matched_volume += matched
-            matched_sell_volume += matched
-            matched_buy_volume += matched
-            realized_gain += (matched / n_s) * (
-                (price - self.c_tx - self.p_fit)
-                + (self.p_grid - price - self.c_tx)
-            )
-            realized_imbalance += self.c_imb * (
-                abs(q_seller - actual_s) + abs(q_buyer - actual_d)
-            )
-            price_sum += price
+        household_generation_actual = (
+            actual[:, None] * self.community_scale_factor * self.solar_weights[None, :]
+        )
+        actual_net = (household_generation_actual - actual_loads) * self.dt_hours
+        actual_surplus = np.mean(np.maximum(actual_net, 0.0), axis=1)
+        actual_deficit = np.mean(np.maximum(-actual_net, 0.0), axis=1)
+        available_sell = np.minimum(n_s * q_seller, n_s * actual_surplus)
+        available_buy = np.minimum(n_s * q_buyer, n_s * actual_deficit)
+        matched = thin_market_efficiency * np.minimum(available_sell, available_buy)
+        realized_gain = float(np.sum((matched / n_s) * (
+            (price - self.c_tx - self.p_fit)
+            + (self.p_grid - price - self.c_tx)
+        )))
+        realized_imbalance = float(self.c_imb * np.sum(
+            np.maximum(q_seller - actual_surplus, 0.0)
+            + np.maximum(q_buyer - actual_deficit, 0.0)
+        ))
+        matched_volume = float(np.sum(matched))
+        matched_sell_volume = matched_volume
+        matched_buy_volume = matched_volume
+        price_sum = float(np.sum(price))
+        total_gain = float(np.sum(gain))
 
         platform_fee_per_sharer = self.platform_fee / n_s
         expected_imbalance = (

@@ -91,6 +91,19 @@ def test_zero_solar_uncertainty_leaves_diversifiable_load_error():
         assert np.isclose(sigma_e, model.sigma_load_kwh / np.sqrt(n_s))
 
 
+def test_oracle_forecasts_do_not_charge_uncommitted_surplus_as_imbalance():
+    model = make_payoff_model()
+    _, actual, _, loads = make_market_inputs()
+    rng = np.random.default_rng(22)
+    realized_load = np.clip(loads[0] + rng.normal(0.0, 0.08, loads[0].shape), 0.3, None)
+
+    _, _, metrics = model.calculate_day_payoffs(
+        0.5, actual[0], actual[0], np.zeros(96), loads[0], realized_load,
+    )
+
+    assert metrics["realized_imbalance_cost"] < 0.1
+
+
 def test_daily_replicator_keeps_share_inside_unit_interval():
     model = make_payoff_model()
     forecast, actual, sigma, loads = make_market_inputs(days=6)

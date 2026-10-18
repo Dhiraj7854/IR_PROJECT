@@ -1,0 +1,12 @@
+kappa,x_star,slope_dF_dx,stability,equilibrium_type
+0.0,0.15501952090663634,0.054791507748541315,unstable,interior
+0.0,0.0,,stable,boundary
+0.0,1.0,,stable,boundary
+0.5,0.0,,stable,boundary
+0.5,1.0,,unstable,boundary
+1.0,0.0,,stable,boundary
+1.0,1.0,,unstable,boundary
+1.5,0.0,,stable,boundary
+1.5,1.0,,unstable,boundary
+2.0,0.0,,stable,boundary
+2.0,1.0,,unstable,boundary
