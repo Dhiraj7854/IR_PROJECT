@@ -106,6 +106,27 @@ def create_sliding_windows(df, feature_cols, target_col='AC_POWER', history_len=
     return np.array(X_list), np.array(y_list), np.array(target_dates)
 
 
+def make_future_covariates(target_dates, latitude, longitude, timezone='Asia/Kolkata'):
+    """Return known time-of-day and pvlib clear-sky features for each forecast step."""
+    import pvlib
+
+    dates = pd.DatetimeIndex(np.asarray(target_dates).reshape(-1))
+    if dates.tz is None:
+        dates = dates.tz_localize(timezone)
+    else:
+        dates = dates.tz_convert(timezone)
+
+    location = pvlib.location.Location(latitude, longitude, tz=timezone)
+    clear_sky_ghi = location.get_clearsky(dates, model='ineichen')['ghi'].to_numpy()
+    fractional_hour = dates.hour + dates.minute / 60.0
+    features = np.column_stack((
+        np.sin(2 * np.pi * fractional_hour / 24.0),
+        np.cos(2 * np.pi * fractional_hour / 24.0),
+        clear_sky_ghi / 1000.0,
+    ))
+    return features.reshape(len(target_dates), target_dates.shape[1], 3).astype(np.float32)
+
+
 def prepare_chronological_splits(df, feature_cols, target_col='AC_POWER', history_len=192, horizon_len=96,
                                   train_ratio=0.70, val_ratio=0.15):
     """
@@ -116,8 +137,17 @@ def prepare_chronological_splits(df, feature_cols, target_col='AC_POWER', histor
     4. Creates sliding window tensors for each partition.
     """
     total_len = len(df)
-    train_end = int(total_len * train_ratio)
-    val_end = int(total_len * (train_ratio + val_ratio))
+    timestamps = pd.DatetimeIndex(df['DATE_TIME'])
+    midnight_indices = np.flatnonzero((timestamps.hour == 0) & (timestamps.minute == 0))
+
+    def next_midnight(index):
+        candidates = midnight_indices[midnight_indices >= index]
+        return int(candidates[0]) if len(candidates) else total_len
+
+    train_end = next_midnight(int(total_len * train_ratio))
+    val_end = next_midnight(int(total_len * (train_ratio + val_ratio)))
+    if val_end <= train_end:
+        raise ValueError("Chronological split ratios must leave at least one validation day")
 
     train_df = df.iloc[:train_end].copy().reset_index(drop=True)
     # Include history_len buffer from preceding split so test/val can predict their respective starting points

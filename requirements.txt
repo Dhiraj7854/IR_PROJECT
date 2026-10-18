@@ -11,3 +11,5 @@ ipykernel>=6.20.0
 nbconvert>=7.0.0
 nbformat>=5.9.0
 python-docx>=1.0.0
+pvlib>=0.10.0
+PyYAML>=6.0.0

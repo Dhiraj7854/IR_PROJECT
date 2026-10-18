@@ -6,6 +6,7 @@ Includes Persistence baselines, model training with early stopping,
 and comprehensive multi-horizon & daylight-only evaluation metrics.
 """
 
+import copy
 import os
 import torch
 import torch.nn as nn
@@ -19,9 +20,12 @@ class Conv1DForecaster(nn.Module):
     1D-CNN model architecture for multi-step solar forecasting with Dropout
     compatible with Monte Carlo Dropout uncertainty estimation.
     """
-    def __init__(self, in_channels=9, seq_len=192, horizon=96, dropout_rate=0.2):
+    def __init__(self, in_channels=9, seq_len=192, horizon=96, dropout_rate=0.2,
+                 future_features=0, predict_residual=False):
         super().__init__()
         self.dropout_rate = dropout_rate
+        self.future_features = future_features
+        self.predict_residual = predict_residual
 
         self.conv_stack = nn.Sequential(
             # Block 1
@@ -48,18 +52,26 @@ class Conv1DForecaster(nn.Module):
         # 192 / 4 = 48 feature maps of length 48
         self.flatten_dim = 128 * 48
         self.fc_head = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
+            nn.Linear(self.flatten_dim + horizon * future_features, 256),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(256, horizon)
         )
 
-    def forward(self, x):
+    def forward(self, x, future_covariates=None, persistence=None):
         # Input shape: (Batch, Seq_Len, Channels) -> transpose to (Batch, Channels, Seq_Len)
         x = x.transpose(1, 2)
         feat = self.conv_stack(x)
         feat = feat.view(feat.size(0), -1)
+        if self.future_features:
+            if future_covariates is None:
+                raise ValueError("future_covariates are required by this model")
+            feat = torch.cat((feat, future_covariates.flatten(start_dim=1)), dim=1)
         out = self.fc_head(feat)
+        if self.predict_residual:
+            if persistence is None:
+                raise ValueError("persistence is required by the residual model")
+            out = persistence + out
         return out
 
 
@@ -81,10 +93,12 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
-        for X_batch, y_batch in train_loader:
+        for batch in train_loader:
+            X_batch, y_batch, *model_inputs = batch
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            model_inputs = [value.to(device) for value in model_inputs]
             optimizer.zero_grad()
-            pred = model(X_batch)
+            pred = model(X_batch, *model_inputs)
             loss = criterion(pred, y_batch)
             loss.backward()
             optimizer.step()
@@ -95,9 +109,11 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
+            for batch in val_loader:
+                X_batch, y_batch, *model_inputs = batch
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                pred = model(X_batch)
+                model_inputs = [value.to(device) for value in model_inputs]
+                pred = model(X_batch, *model_inputs)
                 loss = criterion(pred, y_batch)
                 val_loss += loss.item() * len(X_batch)
 
@@ -109,7 +125,7 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_weights = model.state_dict().copy()
+            best_weights = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
@@ -123,6 +139,7 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=1e-3, device='cpu
 
     if best_weights is not None:
         model.load_state_dict(best_weights)
+    history['best_val_loss'] = best_val_loss
 
     return model, history
 

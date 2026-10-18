@@ -1,0 +1,10 @@
+forecast:
+  latitude: 15.35
+  longitude: 75.16
+  timezone: Asia/Kolkata
+  seeds: [17, 23, 42, 73, 101]
+  epochs: 12
+  batch_size: 64
+  learning_rate: 0.001
+  early_stopping_patience: 3
+  interval_coverage: 0.90
