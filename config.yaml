@@ -8,3 +8,16 @@ forecast:
   learning_rate: 0.001
   early_stopping_patience: 3
   interval_coverage: 0.90
+game:
+  num_prosumers: 100
+  grid_price: 0.22
+  feed_in_price: 0.06
+  transaction_cost: 0.01
+  imbalance_cost: 0.08
+  daily_platform_fee: 0.02
+  thin_market_n0: 8.0
+  load_sigma_kwh: 0.02
+  interval_hours: 0.25
+  replicator_beta: 0.5
+  replicator_eta: 1.0
+  max_share_step: 0.1
