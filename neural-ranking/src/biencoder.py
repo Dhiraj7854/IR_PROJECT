@@ -29,16 +29,23 @@ def load_biencoder(
     device: Optional[str] = None,
 ) -> Any:
     """Load a trained checkpoint, falling back to the MiniLM base model."""
-    global _MODEL, _MODEL_CACHE_KEY
-    from sentence_transformers import SentenceTransformer
-
     model_path = Path(model_name_or_path)
     if model_path.exists():
+        if not model_path.is_dir():
+            raise ValueError(f"Bi-encoder checkpoint path is not a directory: {model_path}")
+        if not (model_path / "modules.json").is_file():
+            raise ValueError(
+                f"Bi-encoder checkpoint is incomplete: {model_path} has no modules.json. "
+                "Training must finish and save the SentenceTransformer model before evaluation."
+            )
         model_source = str(model_path.resolve())
     elif str(model_name_or_path) == str(DEFAULT_MODEL_PATH):
         model_source = DEFAULT_MODEL_NAME
     else:
         model_source = str(model_name_or_path)
+
+    global _MODEL, _MODEL_CACHE_KEY
+    from sentence_transformers import SentenceTransformer
 
     _MODEL = SentenceTransformer(model_source, device=device)
     _MODEL_CACHE_KEY = model_source
