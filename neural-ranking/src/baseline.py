@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import pickle
 import re
 import time
@@ -15,6 +16,7 @@ import pandas as pd
 import scipy.sparse as sp
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.preprocessing import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,7 @@ class BaselineIndex:
 
         # Shared pid array (row i → pid)
         self._pids: Optional[np.ndarray] = None
+        self._pid_to_row: Optional[Dict[int, int]] = None
 
         self._built = False
 
@@ -141,6 +144,9 @@ class BaselineIndex:
                 self._bm25 = state["bm25"]
                 self._tokenized_corpus = state["tokenized_corpus"]
                 self._pids = state["pids"]
+                self._pid_to_row = {
+                    int(pid): row for row, pid in enumerate(self._pids)
+                }
                 self._built = True
                 elapsed = time.perf_counter() - total_started
                 logger.info("Cached retrieval indexes loaded in %.2fs", elapsed)
@@ -152,6 +158,9 @@ class BaselineIndex:
             logger.info("Index cache does not match the corpus; rebuilding it")
 
         self._pids = corpus_df["pid"].to_numpy(dtype=np.int64)
+        self._pid_to_row = {
+            int(pid): row for row, pid in enumerate(self._pids)
+        }
         texts = corpus_df["passage_text"].astype(str).tolist()
 
         logger.info("Building TF-IDF index over %d passages", len(corpus_df))
@@ -242,6 +251,57 @@ class BaselineIndex:
         top_idx = _top_k_indices(scores, k)
         return [(int(self._pids[i]), float(scores[i])) for i in top_idx]
 
+    def retrieve_tfidf_feedback(
+        self,
+        query: str,
+        relevant_pids: Sequence[int],
+        irrelevant_pids: Sequence[int] = (),
+        k: int = 100,
+        *,
+        alpha: float = 1.0,
+        beta: float = 0.75,
+        gamma: float = 0.15,
+    ) -> List[Tuple[int, float]]:
+        """Rank with a transparent Rocchio query updated by explicit feedback."""
+        self._check_built()
+        if self._vectorizer is None or self._tfidf_matrix is None or self._pids is None:
+            raise RuntimeError("TF-IDF index state is incomplete")
+        if self._pid_to_row is None:
+            raise RuntimeError("TF-IDF passage ID mapping is unavailable")
+        if k < 0:
+            raise ValueError("k must be non-negative")
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (alpha, beta, gamma)
+        ):
+            raise ValueError("Rocchio parameters must be finite and non-negative")
+        positives = [int(pid) for pid in relevant_pids]
+        negatives = [int(pid) for pid in irrelevant_pids]
+        if len(set(positives)) != len(positives):
+            raise ValueError("Relevant feedback passage IDs must be unique")
+        if len(set(negatives)) != len(negatives):
+            raise ValueError("Irrelevant feedback passage IDs must be unique")
+        if set(positives).intersection(negatives):
+            raise ValueError("A passage cannot be both relevant and irrelevant")
+        unknown = (set(positives) | set(negatives)).difference(self._pid_to_row)
+        if unknown:
+            raise ValueError(f"Feedback passage IDs are not in the corpus: {sorted(unknown)}")
+        if k == 0:
+            return []
+
+        query_vector = self._vectorizer.transform([query]).tocsr()
+        updated_query = query_vector.multiply(alpha)
+        if positives:
+            positive_rows = [self._pid_to_row[pid] for pid in positives]
+            updated_query = updated_query + beta * self._tfidf_matrix[positive_rows].mean(axis=0)
+        if negatives:
+            negative_rows = [self._pid_to_row[pid] for pid in negatives]
+            updated_query = updated_query - gamma * self._tfidf_matrix[negative_rows].mean(axis=0)
+        updated_query = normalize(sp.csr_matrix(updated_query), norm="l2")
+        scores = (updated_query @ self._tfidf_matrix.T).toarray().ravel()
+        top_idx = _top_k_indices(scores, k)
+        return [(int(self._pids[i]), float(scores[i])) for i in top_idx]
+
 
 # ---------------------------------------------------------------------------
 # Module-level convenience API (lazy singleton)
@@ -291,6 +351,28 @@ def retrieve_tfidf(query: str, k: int = 100) -> List[Tuple[int, float]]:
 def retrieve_bm25(query: str, k: int = 100) -> List[Tuple[int, float]]:
     """Module-level BM25 retrieval using the cached singleton index."""
     return get_index().retrieve_bm25(query, k)
+
+
+def retrieve_tfidf_feedback(
+    query: str,
+    relevant_pids: Sequence[int],
+    irrelevant_pids: Sequence[int] = (),
+    k: int = 100,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.75,
+    gamma: float = 0.15,
+) -> List[Tuple[int, float]]:
+    """Module-level TF-IDF retrieval with explicit Rocchio feedback."""
+    return get_index().retrieve_tfidf_feedback(
+        query,
+        relevant_pids,
+        irrelevant_pids,
+        k,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,6 @@ sentence-transformers
 datasets
 rank-bm25
 scikit-learn
-ranx
 pandas
 pyyaml
 tqdm

@@ -180,6 +180,28 @@ def test_cache_is_rebuilt_for_changed_corpus(tmp_path):
     assert rebuilt.retrieve_bm25("orchards apples", k=1)[0][0] == 2
 
 
+def test_rocchio_feedback_moves_relevant_passage_up(mini_index):
+    before = mini_index.retrieve_tfidf("programming", k=20)
+    after = mini_index.retrieve_tfidf_feedback(
+        "programming",
+        relevant_pids=[3],
+        irrelevant_pids=[2],
+        k=20,
+    )
+    before_rank = [pid for pid, _ in before].index(3)
+    after_rank = [pid for pid, _ in after].index(3)
+
+    assert after_rank <= before_rank
+    assert after[0][0] == 3
+
+
+def test_rocchio_rejects_duplicate_or_conflicting_feedback(mini_index):
+    with pytest.raises(ValueError, match="unique"):
+        mini_index.retrieve_tfidf_feedback("python", [2, 2], k=5)
+    with pytest.raises(ValueError, match="both relevant and irrelevant"):
+        mini_index.retrieve_tfidf_feedback("python", [2], [2], k=5)
+
+
 # ---------------------------------------------------------------------------
 # TREC format
 # ---------------------------------------------------------------------------

@@ -24,3 +24,8 @@ training:
 retrieval:
   stage1_top_k: 100
   rerank_depth: 50
+  rrf_k: 60
+  rrf_weights: {}
+  rocchio_alpha: 1.0
+  rocchio_beta: 0.75
+  rocchio_gamma: 0.15

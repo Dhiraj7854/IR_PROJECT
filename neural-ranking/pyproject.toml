@@ -15,7 +15,6 @@ dependencies = [
     "datasets==3.3.2",
     "rank-bm25==0.2.2",
     "scikit-learn==1.6.1",
-    "pytrec_eval==0.5",
     "pandas==2.2.3",
     "pyyaml==6.0.2",
     "tqdm==4.67.1",
@@ -27,6 +26,12 @@ dependencies = [
 dev = [
     "pytest==8.3.4",
 ]
+query-enhancement = [
+    "pyspellchecker>=0.8.2",
+]
+beir = [
+    "beir==2.0.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -35,4 +40,3 @@ include = ["src*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-

@@ -22,6 +22,7 @@ from src.config import (
     RetrievalConfig,
     TrainingConfig,
     load_config,
+    _coerce_bool,
 )
 
 
@@ -82,6 +83,13 @@ def test_config_convenience_properties():
     assert cfg.stage1_top_k == 100
     assert cfg.top_k_stage1 == 100
     assert cfg.rerank_depth == 50
+
+
+def test_boolean_configuration_parsing_handles_false_strings_and_invalid_values():
+    assert _coerce_bool("false", default=True) is False
+    assert _coerce_bool("yes") is True
+    with pytest.raises(ValueError, match="Invalid boolean"):
+        _coerce_bool("perhaps")
 
 
 def test_load_config_file_not_found():

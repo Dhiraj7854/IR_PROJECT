@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 import os
@@ -12,6 +13,27 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Parse boolean-like values from YAML/CLI input without Python's truthiness trap."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off", ""}:
+            return False
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid boolean value: {value!r}") from error
+    if not math.isfinite(as_float):
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(as_float)
 
 
 def _fallback_yaml_parse(text: str) -> Dict[str, Any]:
@@ -108,10 +130,15 @@ class TrainingConfig:
 
 @dataclass
 class RetrievalConfig:
-    """Top-k retrieval and re-ranking depth parameters."""
+    """Top-k retrieval, re-ranking depth, and hybrid retrieval parameters."""
 
     stage1_top_k: int = 100
     rerank_depth: int = 50
+    rrf_k: int = 60
+    rrf_weights: Optional[Dict[str, float]] = None
+    rocchio_alpha: float = 1.0
+    rocchio_beta: float = 0.75
+    rocchio_gamma: float = 0.15
 
     @property
     def top_k_stage1(self) -> int:
@@ -189,6 +216,11 @@ class Config:
         """Re-ranking candidate depth."""
         return self.retrieval.rerank_depth
 
+    @property
+    def rrf_k(self) -> int:
+        """RRF constant for reciprocal rank fusion."""
+        return self.retrieval.rrf_k
+
 
 def load_config(path: Union[str, Path] = "configs/config.yaml") -> Config:
     """Load configuration from a YAML file into a typed Config dataclass.
@@ -254,7 +286,7 @@ def load_config(path: Union[str, Path] = "configs/config.yaml") -> Config:
         batch_size=int(training_raw.get("batch_size", 64)),
         lr=float(training_raw.get("lr", 0.00002)),
         epochs=int(training_raw.get("epochs", 2)),
-        fp16=bool(training_raw.get("fp16", True)),
+        fp16=_coerce_bool(training_raw.get("fp16", True), default=True),
         warmup_ratio=float(training_raw.get("warmup_ratio", 0.1)),
         early_stopping_patience=int(
             training_raw.get("early_stopping_patience", 1)
@@ -270,6 +302,15 @@ def load_config(path: Union[str, Path] = "configs/config.yaml") -> Config:
             )
         ),
         rerank_depth=int(retrieval_raw.get("rerank_depth", 50)),
+        rrf_k=int(retrieval_raw.get("rrf_k", 60)),
+        rrf_weights=(
+            dict(retrieval_raw.get("rrf_weights", {}))
+            if retrieval_raw.get("rrf_weights") is not None
+            else None
+        ),
+        rocchio_alpha=float(retrieval_raw.get("rocchio_alpha", 1.0)),
+        rocchio_beta=float(retrieval_raw.get("rocchio_beta", 0.75)),
+        rocchio_gamma=float(retrieval_raw.get("rocchio_gamma", 0.15)),
     )
 
     return Config(

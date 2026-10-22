@@ -4,6 +4,10 @@ This project builds and evaluates an MS MARCO passage-retrieval pipeline that co
 
 ## Architecture
 
+The project now includes a rank-fusion layer for hybrid retrieval. `src/hybrid.py`
+implements reciprocal rank fusion (RRF) for merging BM25 and dense bi-encoder
+rankings without calibrating raw score magnitudes across retrievers.
+
 ```mermaid
 flowchart LR
     D[MS MARCO source data] --> P[Prepare corpus, query splits, qrels, triplets]
@@ -13,12 +17,17 @@ flowchart LR
     L --> LR[TF-IDF and BM25 runs]
     B --> BR[Bi-encoder val/test runs]
     L -->|top 100 candidates| C
+    L --> H[RRF BM25 + bi-encoder]
+    B --> H
+    H -->|candidate pool| C
     C --> CR[Cross-encoder reranked val/test runs]
     LR --> E[Metrics, comparison table, Pareto plot]
     BR --> E
+    H --> E
     CR --> E
-    L --> G[Gradio demo: BM25 vs cross-encoder]
+    L --> G[Gradio search, feedback, and error analysis]
     C --> G
+    H --> G
 ```
 
 ## Setup
@@ -47,6 +56,14 @@ Prepare the MS MARCO data once. This downloads the configured source and writes 
 ```bash
 python scripts/prepare_data.py --config configs/config.yaml --output_dir data/processed
 ```
+
+The sampler uses deterministic passage ordering, and the train/validation/test
+query splits follow the source stream order. Re-running against the same
+upstream dataset revision and configuration therefore regenerates the same
+corpus IDs and qrels. Keep `data/processed/test_qrels.parquet` with experiment
+artifacts; evaluation manifests also record its SHA-256 hash. This deterministic
+ordering may not match passage IDs from older preparations, so use an existing
+run/checkpoint bundle with its corresponding saved corpus and qrels.
 
 Generated data, model checkpoints, runs, and result files are ignored by Git. Keep them in Colab/Drive or copy them into the matching local directories before running downstream steps.
 
@@ -114,6 +131,23 @@ The run contains the re-ranked top 100; the leading 10 entries per query are
 the top-10 ranking. Keeping 100 entries is necessary for an actual
 `Recall@100` calculation in the final comparison.
 
+The default top-k is now 100. Candidate depth and reranking depth can be
+configured independently. To generate candidate-depth comparisons for BM25
+and RRF candidates (each run is saved under a depth-specific filename):
+
+```bash
+python scripts/eval_hybrid.py --candidate-depth 10 --rerank-depth 10 --top-k 100 --splits val test
+python scripts/eval_hybrid.py --candidate-depth 50 --rerank-depth 50 --top-k 100 --splits val test
+python scripts/eval_hybrid.py --candidate-depth 100 --rerank-depth 50 --top-k 100 --splits val test
+```
+
+This writes BM25→cross-encoder, RRF, and RRF→cross-encoder TREC runs and
+per-run JSON metrics beneath `artifacts/runs/`. Candidate-generation recall is
+reported separately from final ranking metrics. The reranker scores the
+configured prefix and keeps the unreranked candidate tail in its original
+order so the run can still contain 100 documents. Outputs are never replaced
+unless `--overwrite` is explicitly passed.
+
 For the documented small overfit diagnostic, train on 100 queries for more epochs and inspect logged loss/validation MRR:
 
 ```bash
@@ -127,6 +161,13 @@ Compute per-query and macro metrics, median latency measured on 200 test queries
 ```bash
 python scripts/run_all_eval.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --latency-queries 200
 ```
+
+The comparison runner includes depth-matched RRF and reranking runs when
+present. It excludes `Recall@100` from truncated (<100 result) runs, records
+the exact qrels file hash and run/config identifiers, and writes reproducible
+paired bootstrap confidence intervals for metric differences versus BM25 to
+`artifacts/results/paired_differences.json`. It preserves existing comparison
+files unless `--overwrite` is specified.
 
 Outputs: `artifacts/results/comparison_table.md`, `comparison_table.csv`, `per_query_metrics.csv`, and `pareto.png`. The runner flags suspicious MRR values rather than treating them as accepted results. To inspect the table and plot interactively, open [`notebooks/02_results.ipynb`](notebooks/02_results.ipynb) from this directory after evaluation.
 
@@ -146,7 +187,79 @@ python scripts/run_experiments.py --config configs/config.yaml --data-dir data/p
 
 By default the random-negative model is retrained for two epochs. Use `--reuse-random-checkpoint` if `artifacts/biencoder_random/` already contains the trained checkpoint. The report and 150-dpi figures are written to `artifacts/results/ablations.md` and `ablations_*.png`.
 
-### 6. Tests and command help
+### 6. Hybrid RRF evaluation
+
+`src/hybrid.py` fuses independent BM25 and bi-encoder rankings using
+`sum(weight_i / (rrf_k + rank_i))`, with one-based ranks, default `rrf_k=60`,
+and unit weights. It does not add uncalibrated raw retrieval scores. Ties are
+resolved by canonical passage ID; source ranks and retriever names are retained.
+`configs/config.yaml` supports `rrf_k`, optional `rrf_weights`, and independent
+candidate/rerank depths.
+
+```bash
+python scripts/eval_hybrid.py --candidate-depth 100 --rerank-depth 50 --top-k 100 --splits val test
+python scripts/run_all_eval.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts
+```
+
+For paired cross-encoder diagnosis, compare BM25 and RRF candidate runs from
+the same query/qrels split and use the same candidate depth. Candidate recall
+measures relevant passages present before reranking; final metrics measure the
+ranked output. When reranking fewer than 100 candidates, the unscored tail is
+preserved in candidate order so a full top-100 run is available. Run
+`eval_hybrid.py` at candidate depths 10, 50, and 100 for a depth sweep.
+
+### 7. Optional BEIR out-of-domain evaluation
+
+BEIR is optional and no dataset is downloaded during install, tests, or search.
+Explicitly prepare the official SciFact archive (or NFCorpus):
+
+```bash
+python -m pip install -e ".[beir]"
+python scripts/prepare_beir.py --dataset scifact
+python scripts/eval_beir.py --dataset scifact --candidate-depth 100 --rerank-depth 50 --top-k 100
+```
+
+To run NFCorpus, replace `scifact` with `nfcorpus`. Runs and metrics are stored
+separately under `artifacts/beir/<dataset>/`. The evaluation uses the official
+test qrels without tuning on them and labels its mode as zero-shot. A
+cross-encoder run is included only when a compatible local project checkpoint
+exists; otherwise BM25, bi-encoder, and RRF remain available. The corpus and
+embedding cache are separate for each BEIR dataset.
+
+### 8. Query enhancement
+
+Unmodified query text is the default baseline. The optional methods are
+Unicode/whitespace normalization, spelling correction, and dictionary-based
+synonym expansion. Edit `configs/synonyms.json` to change expansion terms.
+Spelling correction uses an optional package and preserves capitalization and
+short tokens to reduce technical/proper-name changes.
+
+```bash
+python scripts/eval_query_enhancement.py --retriever bm25 --methods original normalize synonym --splits val test
+python -m pip install -e ".[query-enhancement]"
+python scripts/eval_query_enhancement.py --retriever bm25 --methods original spell --splits val test
+```
+
+The script saves transformed queries, ranked runs, per-query metrics, latency,
+and paired metric changes versus the original query. Enhancement is not
+enabled by default and its results are separate from the baseline.
+
+### 9. Performance benchmark
+
+The benchmark warms each selected method, uses the same selected query set
+and result depth, and reports mean warm-query latency, p50, p95, throughput,
+Python-tracked peak memory, and retrieval quality:
+
+```bash
+python scripts/benchmark_retrieval.py --split test --methods tfidf bm25 --query-limit 200 --top-k 100
+python scripts/benchmark_retrieval.py --split test --methods bm25 biencoder rrf --query-limit 200 --top-k 100
+```
+
+Memory uses `tracemalloc` and does not include all native/GPU allocations.
+For cross-method comparisons, run on the same hardware, query set, warm-up,
+and result depth.
+
+### 10. Tests and command help
 
 ```bash
 python -m pytest -q
@@ -159,87 +272,90 @@ python scripts/eval_crossencoder.py --help
 python scripts/evaluate.py --help
 python scripts/run_all_eval.py --help
 python scripts/run_experiments.py --help
+python scripts/eval_hybrid.py --help
+python scripts/eval_query_enhancement.py --help
+python scripts/prepare_beir.py --help
+python scripts/eval_beir.py --help
+python scripts/benchmark_retrieval.py --help
 ```
+
+The tests use small synthetic corpora and do not download datasets or model
+checkpoints. Dataset integration tests require the prepared MS MARCO files.
+
+## Metrics and evaluation conventions
+
+- **MRR@10:** reciprocal rank of the first positively judged result, averaged
+  over qrels query IDs.
+- **NDCG@10:** graded gain `2^relevance - 1`, discounted by `log2(rank+1)`,
+  normalized by the ideal ordering.
+- **Recall@10 / Recall@100:** fraction of positively judged passages retrieved
+  within the cutoff. Queries with no positive judgments score zero.
+- **MAP@10:** precision at each positive hit in the top 10, divided by the
+  total number of positive qrels for that query.
+- **P@5:** positive hits in the first five divided by five.
+
+Missing relevance values are skipped as unjudged qrels rows; qrels with no
+positive labels yield zero-valued metrics. Empty runs and missing query results
+are scored as zero. The standalone `evaluate.py` refuses to report
+Recall@100 from runs shorter than 100 documents. The comparison runner also
+omits it for truncated run files and marks its validity. Candidate recall is
+reported separately. `run_all_eval.py` writes paired, query-level bootstrap
+intervals for differences from BM25; intervals are descriptive and do not
+replace repeated-seed experiments.
 
 ## Current comparison results
 
-The values below come from the completed Colab evaluation against the 750-query test split. Latency is the median over 200 queries in that Colab run. Exact outputs are in [`artifacts/results/comparison_table.csv`](artifacts/results/comparison_table.csv), [`comparison_table.md`](artifacts/results/comparison_table.md), and [`per_query_metrics.csv`](artifacts/results/per_query_metrics.csv).
+No benchmark was run in this checkout: the prepared corpus, split qrels, and
+model checkpoints are not present. Historical numbers formerly listed here
+were not independently reproducible from the current checkout, and a previous
+cross-encoder Recall@100 value came from a top-10 run. It is intentionally not
+reported as Recall@100. Do not treat missing results as zero.
 
-| System | MRR@10 | NDCG@10 | P@5 | Recall@100 | Median latency (ms/query) |
-|---|---:|---:|---:|---:|---:|
-| TF-IDF | 0.2943 | 0.3854 | 0.1091 | 0.9073 | 55.13 |
-| BM25 | 0.3316 | 0.4230 | 0.1192 | 0.9087 | 153.47 |
-| Bi-encoder | 0.4895 | 0.5790 | 0.1525 | 0.9820 | 7.42 |
-| BM25 → Cross-encoder | 0.4016 | 0.4835 | 0.1272 | 0.7544* | 284.89 |
+| System | MRR@10 | NDCG@10 | Recall@10 | Recall@100 | MAP@10 | Latency |
+|---|---|---|---|---|---|---|
+| TF-IDF | not run | not run | not run | not run | not run | not run |
+| BM25 | not run | not run | not run | not run | not run | not run |
+| Bi-encoder | not run | not run | not run | not run | not run | not run |
+| BM25 → Cross-encoder | not run | not run | not run | not run | not run | not run |
+| Hybrid RRF | not run | not run | not run | not run | not run | not run |
+| Hybrid RRF → Cross-encoder | not run | not run | not run | not run | not run | not run |
 
-All runs contain 750 test queries; latency was measured over 200 test queries
-in Colab. `*` The cross-encoder run file contains only ranks 1–10 (7,500 lines
-for 750 queries), so its reported `Recall@100` is recall over the returned
-top-10, not true Recall@100. Re-run cross-encoder evaluation with `--top-k 100`
-before comparing that metric at depth 100. The comparison runner did not flag
-any configured suspicious scores.
-
-The extracted output bundle did not include Colab's `test_qrels.parquet`.
-Consequently, the Colab metrics are recorded as reported by its generated
-comparison files, but cannot currently be independently reproduced against the
-local qrels file. For a local end-to-end verification, also copy the exact
-`test_qrels.parquet` used in Colab into `data/processed/`.
-
-Training metadata records one completed epoch (55 optimizer steps) for each
-bi-encoder run; best sampled-validation MRR@10 was 0.9705 for hard negatives
-and 0.9712 for random negatives. The cross-encoder completed 658 steps in
-273.59 seconds and saved its best checkpoint at validation MRR@10 0.4134
-(step 329). Bi-encoder validation uses a sampled 2,000-passage corpus; these
-training-time validation scores are not directly comparable to the full-corpus
-test scores above.
-
-### Pareto plot
-
-![Test-set MRR@10 versus median latency, logarithmic latency axis](artifacts/results/pareto.png)
-
-Generated by `scripts/run_all_eval.py`; latency is on a logarithmic x-axis.
-
-### Ablation results
-
-Full tables and figures are in [`artifacts/results/ablations.md`](artifacts/results/ablations.md).
-
-| Experiment | Setting | MRR@10 | Median latency (ms/query) |
-|---|---|---:|---:|
-| Bi-encoder negative sampling (validation) | Hard | 0.4968 | — |
-| Bi-encoder negative sampling (validation) | Random | 0.5260 | — |
-| Cross-encoder depth (validation) | BM25 top-50 | 0.4451 | 203.83 |
-| Cross-encoder depth (validation) | BM25 top-100 | 0.4134 | 265.49 |
-| Cross-encoder depth (validation) | BM25 top-200 | 0.3764 | 344.82 |
-
-Query-length analysis (test split):
-
-| Bucket | Queries | Word count | BM25 MRR@10 | BM25 → Cross-encoder MRR@10 |
-|---|---:|---:|---:|---:|
-| Short | 250 | 2–5 | 0.3664 | 0.4322 |
-| Medium | 250 | 5–7 | 0.3029 | 0.3808 |
-| Long | 250 | 7–22 | 0.3256 | 0.3919 |
-
-![Hard vs random negatives](artifacts/results/ablations_negatives.png)
-![Cross-encoder candidate depth](artifacts/results/ablations_rerank_depth.png)
-![Query length results](artifacts/results/ablations_query_length.png)
+Run the workflows above to create a local comparison and Pareto plot. The
+runner records query-level metrics and paired bootstrap confidence intervals
+in `artifacts/results/`. The research questions below—hybrid gain, reranking
+gain at a fixed candidate set, candidate-depth/latency trade-offs, query-type
+effects, and transfer to BEIR—remain unanswered until those artifacts exist.
+Query enhancement and user relevance feedback are evaluated separately from
+ordinary benchmark retrieval.
 
 ## Gradio demo
 
 [`app/demo.py`](app/demo.py) is a Gradio Blocks search and evaluation dashboard.
 It loads the corpus, cached lexical indexes, bi-encoder and embeddings, and
 cross-encoder once at startup. On the Search tab, compare one or more of
-TF-IDF, BM25, bi-encoder, and BM25 → cross-encoder. Result cards show rank,
+TF-IDF, BM25, bi-encoder, BM25 → cross-encoder, Hybrid RRF, and Hybrid RRF →
+cross-encoder. Result cards show rank,
 PID, score, a passage excerpt, query-term highlights, and rank movement
 relative to BM25. Settings control the systems, number of results, and
-cross-encoder candidate depth. Summary tiles, a BM25/cross-encoder overlap
+candidate depth. Summary tiles, overlap
 donut, and latency bars help explain how the rankings differ.
+
+The Query error analysis tab is enabled when test queries and qrels are
+prepared. It distinguishes judged test queries from live queries, displays
+relevant/missed IDs and per-query metrics, and compares candidate recall and
+rank movement. Filters include query length and (when generated per-query
+metrics are available) retrieval failures, low-quality queries, and hybrid
+improvements/damages. The Relevance feedback tab offers session-local explicit
+positive/negative labels and a TF-IDF Rocchio update; its results are not
+treated as benchmark judgments.
 
 The Benchmarks tab renders the evaluation table and responsive inline SVG
 charts for quality versus latency and the three ablation studies. The SVG
 charts scale with the page, show exact point values on hover, and replace the
 previous static PNG display. The ablation charts are shown when
 `artifacts/results/ablations.md` is present; comparison metrics are read from
-`artifacts/results/comparison_table.csv` (with documented values as fallback).
+`artifacts/results/comparison_table.csv`; no fallback benchmark values are
+shown when outputs are absent.
 The How it works tab explains the rankers and metrics.
 
 After restoring the checkpoints, embedding cache, and prepared corpus, launch

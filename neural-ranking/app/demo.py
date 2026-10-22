@@ -16,6 +16,7 @@ import argparse
 import csv
 import html
 import inspect
+import json
 import logging
 import os
 import random
@@ -55,17 +56,10 @@ SYSTEMS: Dict[str, Tuple[str, str, str]] = {
     "BM25": ("bm25", "#3b82f6", "Sparse lexical match with length normalisation"),
     "Bi-encoder": ("dense", "#10b981", "Dense retrieval: query and passage embedded separately"),
     "BM25 → Cross-encoder": ("cross", "#8b5cf6", "BM25 top-N re-scored jointly by a neural cross-encoder"),
+    "Hybrid RRF": ("rrf", "#06b6d4", "BM25 + bi-encoder merged by reciprocal rank fusion"),
+    "Hybrid RRF → Cross-encoder": ("rrf_cross", "#ec4899", "RRF candidates jointly re-scored by a cross-encoder"),
 }
 DEFAULT_SYSTEMS = ["BM25", "BM25 → Cross-encoder"]
-
-# Numbers from the README's completed Colab evaluation (750 test queries). Used only
-# if artifacts/results/comparison_table.csv is not present locally.
-FALLBACK_BENCHMARK = [
-    {"System": "TF-IDF", "MRR@10": 0.2943, "NDCG@10": 0.3854, "P@5": 0.1091, "Recall@100": 0.9073, "Median latency (ms/query)": 55.13},
-    {"System": "BM25", "MRR@10": 0.3316, "NDCG@10": 0.4230, "P@5": 0.1192, "Recall@100": 0.9087, "Median latency (ms/query)": 153.47},
-    {"System": "Bi-encoder", "MRR@10": 0.4895, "NDCG@10": 0.5790, "P@5": 0.1525, "Recall@100": 0.9820, "Median latency (ms/query)": 7.42},
-    {"System": "BM25 → Cross-encoder", "MRR@10": 0.4016, "NDCG@10": 0.4835, "P@5": 0.1272, "Recall@100": 0.7544, "Median latency (ms/query)": 284.89},
-]
 
 _STOPWORDS = frozenset(
     "a an and are as at be but by do does did for from had has have how i if in into is it its "
@@ -88,7 +82,11 @@ class Backend:
     tfidf: Callable[[str, int], List[Hit]]
     dense: Callable[[str, int], List[Hit]]
     rerank: Callable[[str, List[int], int], List[Hit]]
+    feedback: Optional[Callable[[str, List[int], List[int], int], List[Hit]]] = None
     device: str = "cpu"
+    rrf_k: int = 60
+    benchmark_queries: Optional[Dict[str, str]] = None
+    benchmark_qrels: Optional[Dict[str, Dict[str, int]]] = None
 
     @property
     def corpus_size(self) -> int:
@@ -104,6 +102,8 @@ def load_backend() -> Backend:
     from src.biencoder import configure_retrieval, load_biencoder, retrieve_biencoder
     from src.config import load_config
     from src.crossencoder import load_crossencoder, rerank
+    from src.evaluate import evaluate_run
+    from src.hybrid import fuse_ranked_lists
 
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
     max_seq_len = config.models.max_seq_len
@@ -165,8 +165,29 @@ def load_backend() -> Backend:
         tfidf=index.retrieve_tfidf,
         dense=retrieve_biencoder,
         rerank=_rerank,
+        feedback=lambda query, positive, negative, k: index.retrieve_tfidf_feedback(
+            query,
+            positive,
+            negative,
+            k,
+            alpha=config.retrieval.rocchio_alpha,
+            beta=config.retrieval.rocchio_beta,
+            gamma=config.retrieval.rocchio_gamma,
+        ),
         device="GPU" if use_cuda else "CPU",
+        rrf_k=config.retrieval.rrf_k,
     )
+    query_path = DATA_DIR / "test_queries.parquet"
+    qrels_path = DATA_DIR / "test_qrels.parquet"
+    if query_path.is_file() and qrels_path.is_file():
+        from src.evaluate import load_qrels
+
+        query_frame = pd.read_parquet(query_path)
+        backend.benchmark_queries = {
+            str(row.query_id): str(row.query_text)
+            for row in query_frame.itertuples(index=False)
+        }
+        backend.benchmark_qrels = load_qrels(qrels_path)
 
     # Warm up so the first user query is not penalised by lazy initialisation.
     sample = list(passages)[:100]
@@ -371,8 +392,11 @@ def _read_benchmark() -> List[Dict[str, object]]:
                     "mrr@10": "MRR@10",
                     "ndcg@10": "NDCG@10",
                     "p@5": "P@5",
+                    "recall@10": "Recall@10",
                     "recall@100": "Recall@100",
+                    "map@10": "MAP@10",
                     "median_latency_ms": "Median latency (ms/query)",
+                    "recall@100_valid": "Recall@100 valid",
                 }
                 parsed: List[Dict[str, object]] = []
                 for row in rows:
@@ -381,14 +405,19 @@ def _read_benchmark() -> List[Dict[str, object]]:
                         if value in (None, ""):
                             continue
                         label = aliases.get(key.strip().lower(), key)
-                        normalised[label] = value if label == "System" else float(value)
+                        if label == "System":
+                            normalised[label] = value
+                        elif label == "Recall@100 valid":
+                            normalised[label] = value.strip().lower() == "true"
+                        else:
+                            normalised[label] = float(value)
                     if "System" in normalised:
                         parsed.append(normalised)
                 if parsed:
                     return parsed
-        except (ValueError, OSError) as exc:  # fall back to the README numbers
+        except (ValueError, OSError) as exc:
             logger.warning("Could not parse %s: %s", path, exc)
-    return FALLBACK_BENCHMARK
+    return []
 
 
 def _read_ablation_tables() -> List[List[Dict[str, object]]]:
@@ -594,7 +623,22 @@ def _render_query_length_chart(rows: Sequence[Dict[str, object]]) -> str:
 
 def render_benchmark() -> str:
     rows = _read_benchmark()
-    preferred_metrics = ["MRR@10", "NDCG@10", "P@5", "Recall@100", "Median latency (ms/query)"]
+    if not rows:
+        return (
+            '<div class="bench"><div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>'
+            "<h2>No local benchmark results</h2><p>Run the evaluation commands to populate "
+            "artifacts/results/comparison_table.csv. No fallback or fabricated metrics are displayed.</p>"
+            "</div></div>"
+        )
+    preferred_metrics = [
+        "MRR@10",
+        "NDCG@10",
+        "P@5",
+        "Recall@10",
+        "Recall@100",
+        "MAP@10",
+        "Median latency (ms/query)",
+    ]
     metrics = [metric for metric in preferred_metrics if any(metric in row for row in rows)]
     best = {}
     for metric in metrics:
@@ -611,8 +655,7 @@ def render_benchmark() -> str:
                 cells.append("<td>—</td>")
                 continue
             is_best = abs(value - best[metric]) < 1e-9
-            star = "*" if row["System"].endswith("Cross-encoder") and metric == "Recall@100" else ""
-            cells.append(f'<td class="{"best" if is_best else ""}">{value:.4g}{star}</td>')
+            cells.append(f'<td class="{"best" if is_best else ""}">{value:.4g}</td>')
         color = SYSTEMS.get(row["System"], ("", "#64748b", ""))[1]
         body.append(
             f'<tr><th><span class="dot" style="background:{color}"></span>{html.escape(row["System"])}</th>{"".join(cells)}</tr>'
@@ -639,11 +682,10 @@ def render_benchmark() -> str:
 <div class="bench">
   <div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>
     <h2>How the rankers compare</h2>
-    <p>Quality metrics are computed on the held-out test queries. Latency is the median over 200 queries.</p>
+    <p>Metrics and latency are loaded from local evaluation artifacts. Query counts and validity are recorded by the evaluation runner.</p>
   </div>
   <table><thead><tr><th>System</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>
-  <p class="fine">Best value per column highlighted. 750 test queries, MS MARCO passages.
-  *Cross-encoder Recall@100 was computed over a run file holding only its top-10, so it is not a true Recall@100.</p>
+  <p class="fine">Best value per column highlighted. Results are loaded from local evaluation artifacts; truncated runs do not report Recall@100.</p>
   {pareto}
   <div class="bench-intro ablation-intro"><span class="eyebrow">ABLATION STUDIES</span>
     <h2>What changes the ranking?</h2>
@@ -661,7 +703,9 @@ HOW_IT_WORKS = """
 | **TF-IDF** | Weight terms by frequency and rarity, cosine similarity | Fast, transparent | No length normalisation, exact words only |
 | **BM25** | TF-IDF refinement with saturation and length normalisation | Strong lexical baseline | Vocabulary mismatch (synonyms, paraphrase) |
 | **Bi-encoder** | Embed query and passage independently, compare vectors | Very fast at query time, semantic | Single vector per passage loses detail |
+| **Hybrid RRF** | Fuse BM25 and bi-encoder ranks with Reciprocal Rank Fusion | Combines complementary lexical and semantic candidates | Adds dense retrieval cost; needs evaluation |
 | **BM25 → Cross-encoder** | Re-score BM25's top-N by reading query and passage together | Most precise per pair | Slow; **capped by BM25's recall** |
+| **Hybrid RRF → Cross-encoder** | Re-score a fused BM25+dense candidate pool | Combines broad recall and interaction scoring | Higher latency and candidate costs |
 
 ### Reading the result cards
 - **Coloured bar:** the score, scaled within that column. Scores from different systems are on different scales, so compare ranks, not raw values.
@@ -828,6 +872,8 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
         timings: Dict[str, float] = {}
         notes: Dict[str, str] = {}
         cross_hits: Optional[List[Hit]] = None
+        dense_candidates: Optional[List[Hit]] = None
+        rrf_hits: Optional[List[Hit]] = None
 
         for name in systems:
             key = SYSTEMS[name][0]
@@ -841,13 +887,45 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 t0 = time.perf_counter()
                 results[name] = backend.dense(query, top_k)
                 timings[name], notes[name] = (time.perf_counter() - t0) * 1000.0, "embed query + dot product"
-            else:
+            elif key == "cross":
                 t0 = time.perf_counter()
                 cross_hits = backend.rerank(query, [int(p) for p, _ in stage1], top_k)
                 rerank_ms = (time.perf_counter() - t0) * 1000.0
                 results[name] = cross_hits
                 timings[name] = stage1_ms + rerank_ms
                 notes[name] = f"{stage1_ms:.0f} ms BM25 + {rerank_ms:.0f} ms re-rank of {len(stage1)}"
+            else:
+                if dense_candidates is None:
+                    t0 = time.perf_counter()
+                    dense_candidates = backend.dense(query, depth)
+                    dense_ms = (time.perf_counter() - t0) * 1000.0
+                else:
+                    dense_ms = 0.0
+                if rrf_hits is None:
+                    fused = fuse_ranked_lists(
+                        [stage1, dense_candidates],
+                        k=backend.rrf_k,
+                        source_names=["bm25", "biencoder"],
+                    )
+                    rrf_hits = [(item["pid"], item["score"]) for item in fused]
+                if key == "rrf":
+                    results[name] = rrf_hits[:top_k]
+                    timings[name] = stage1_ms + dense_ms
+                    notes[name] = f"RRF k={backend.rrf_k}; top-{depth} candidates per retriever"
+                else:
+                    t0 = time.perf_counter()
+                    fused_candidates = rrf_hits[:depth]
+                    hybrid_cross_hits = backend.rerank(
+                        query, [int(pid) for pid, _ in fused_candidates], top_k
+                    )
+                    rerank_ms = (time.perf_counter() - t0) * 1000.0
+                    results[name] = hybrid_cross_hits
+                    cross_hits = hybrid_cross_hits
+                    timings[name] = stage1_ms + dense_ms + rerank_ms
+                    notes[name] = (
+                        f"BM25 + bi-encoder + RRF + {rerank_ms:.0f} ms re-rank "
+                        f"of {len(fused_candidates)} candidates"
+                    )
 
         ordered = [name for name in SYSTEMS if name in results]
         columns = "".join(
@@ -861,6 +939,242 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
             query, top_k, depth, stage1, cross_hits, bm25_rank, {n: timings[n] for n in ordered}
         )
         return insights, f'<div class="cols">{columns}</div>'
+
+    def feedback_candidates(query: str):
+        query = (query or "").strip()
+        if not query:
+            raise gr.Error("Enter a query before retrieving feedback candidates.")
+        hits = backend.tfidf(query, 20)
+        options = [
+            f"{pid} — {snippet(backend.passages[int(pid)], [], 120)}"
+            for pid, _ in hits
+        ]
+        state = {
+            "query": query,
+            "hits": [(int(pid), float(score)) for pid, score in hits],
+        }
+        rows = "".join(
+            f"<tr><td>{rank}</td><td>{int(pid)}</td><td>{html.escape(backend.passages[int(pid)])}</td><td>{score:.4f}</td></tr>"
+            for rank, (pid, score) in enumerate(hits, start=1)
+        )
+        table = (
+            "<p>Session-local candidates. Mark relevant and/or irrelevant, then rerank.</p>"
+            "<table><thead><tr><th>Rank</th><th>PID</th><th>Passage</th><th>TF-IDF score</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
+        return table, gr.update(choices=options, value=[]), gr.update(
+            choices=options, value=[]
+        ), state
+
+    def apply_feedback(state: dict, relevant: List[str], irrelevant: List[str]):
+        if not state or not state.get("query"):
+            raise gr.Error("Retrieve candidate passages before applying feedback.")
+        positive_ids = [int(value.split(" — ", 1)[0]) for value in (relevant or [])]
+        negative_ids = [int(value.split(" — ", 1)[0]) for value in (irrelevant or [])]
+        if set(positive_ids).intersection(negative_ids):
+            raise gr.Error("A passage cannot be marked both relevant and irrelevant.")
+        initial_hits: List[Hit] = state["hits"]
+        allowed_ids = {pid for pid, _ in initial_hits}
+        if not set(positive_ids + negative_ids).issubset(allowed_ids):
+            raise gr.Error("Feedback must refer only to passages shown in this session.")
+        if backend.feedback is None:
+            raise gr.Error("Relevance feedback is unavailable in this backend.")
+        updated = backend.feedback(
+            state["query"],
+            positive_ids,
+            negative_ids,
+            len(initial_hits),
+        )
+        before_rank = {pid: rank for rank, (pid, _) in enumerate(initial_hits, start=1)}
+        after_rank = {pid: rank for rank, (pid, _) in enumerate(updated, start=1)}
+        rows = []
+        for rank, (pid, score) in enumerate(updated, start=1):
+            previous = before_rank.get(pid)
+            movement = (
+                "new"
+                if previous is None
+                else f"{previous} → {rank} ({previous - rank:+d})"
+            )
+            rows.append(
+                f"<tr><td>{rank}</td><td>{pid}</td><td>{html.escape(backend.passages[pid])}</td>"
+                f"<td>{score:.4f}</td><td>{movement}</td></tr>"
+            )
+        return (
+            "<p>Rocchio feedback is user-provided and session-local; "
+            "it is not benchmark relevance.</p>"
+            "<table><thead><tr><th>New rank</th><th>PID</th><th>Passage</th>"
+            f"<th>TF-IDF score</th><th>Rank change</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
+        )
+
+    def filtered_benchmark_ids(category: str) -> List[str]:
+        queries = backend.benchmark_queries or {}
+        if category == "All":
+            return list(queries)
+        if category in {"Short", "Medium", "Long"}:
+            bounds = {"Short": (0, 3), "Medium": (4, 6), "Long": (7, 10**9)}
+            lower, upper = bounds[category]
+            return [
+                qid for qid, text in queries.items()
+                if lower <= len(text.split()) <= upper
+            ]
+        metrics_path = RESULTS_DIR / "per_query_metrics.csv"
+        if not metrics_path.is_file():
+            return []
+        import pandas as pd
+
+        frame = pd.read_csv(metrics_path)
+        if not {"system", "query_id", "MRR@10"}.issubset(frame.columns):
+            raise ValueError(f"Per-query metrics file has unexpected columns: {metrics_path}")
+        values = {
+            (str(int(row["query_id"])), str(row["system"])): float(row["MRR@10"])
+            for _, row in frame.iterrows()
+        }
+        selected = []
+        for qid in queries:
+            bm25 = values.get((qid, "BM25"))
+            dense = values.get((qid, "Bi-encoder"))
+            hybrid = values.get((qid, "Hybrid RRF"))
+            bm25_cross = values.get((qid, "BM25 → Cross-encoder"))
+            hybrid_cross = values.get((qid, "Hybrid RRF → Cross-encoder"))
+            if category == "Retrieval failures" and all(
+                score is not None and score <= 0 for score in (bm25, dense)
+            ):
+                selected.append(qid)
+            elif category == "Low ranking quality" and max(
+                (score for score in (bm25, dense, hybrid) if score is not None),
+                default=1.0,
+            ) < 0.1:
+                selected.append(qid)
+            elif category == "Hybrid improves" and hybrid is not None and bm25 is not None and hybrid > bm25:
+                selected.append(qid)
+            elif category == "Hybrid damages" and hybrid is not None and bm25 is not None and hybrid < bm25:
+                selected.append(qid)
+            elif category == "Reranking improves" and (
+                (bm25_cross is not None and bm25 is not None and bm25_cross > bm25)
+                or (
+                    hybrid_cross is not None
+                    and hybrid is not None
+                    and hybrid_cross > hybrid
+                )
+            ):
+                selected.append(qid)
+            elif category == "Reranking damages" and (
+                (bm25_cross is not None and bm25 is not None and bm25_cross < bm25)
+                or (
+                    hybrid_cross is not None
+                    and hybrid is not None
+                    and hybrid_cross < hybrid
+                )
+            ):
+                selected.append(qid)
+        return selected
+
+    def update_error_query_choices(category: str):
+        query_ids = filtered_benchmark_ids(category)
+        return gr.update(
+            choices=[(f"{qid}: {(backend.benchmark_queries or {}).get(qid, '')[:80]}", qid)
+                    for qid in query_ids],
+            value=query_ids[0] if query_ids else None,
+        )
+
+    def analyze_benchmark_query(query_id: str):
+        if not backend.benchmark_queries or not backend.benchmark_qrels:
+            return "<p>Judged test queries and qrels are unavailable. Prepare the dataset first.</p>"
+        qid = str(query_id or "")
+        query_text = backend.benchmark_queries.get(qid)
+        judgments = backend.benchmark_qrels.get(qid)
+        if query_text is None or judgments is None:
+            raise gr.Error("Select a judged test query with available qrels.")
+
+        depth = 100
+        bm25_hits = backend.bm25(query_text, depth)
+        tfidf_hits = backend.tfidf(query_text, depth)
+        dense_hits = backend.dense(query_text, depth)
+        fused_data = fuse_ranked_lists(
+            [bm25_hits, dense_hits],
+            k=backend.rrf_k,
+            source_names=["bm25", "biencoder"],
+        )
+        rrf_hits: List[Hit] = [
+            (item["pid"], item["score"]) for item in fused_data
+        ]
+        bm25_cross = backend.rerank(query_text, [pid for pid, _ in bm25_hits], depth)
+        rrf_cross = backend.rerank(query_text, [pid for pid, _ in rrf_hits[:depth]], depth)
+        methods = {
+            "TF-IDF": tfidf_hits,
+            "BM25": bm25_hits,
+            "Bi-encoder": dense_hits,
+            "Hybrid RRF": rrf_hits,
+            "BM25 → Cross-encoder": bm25_cross,
+            "Hybrid RRF → Cross-encoder": rrf_cross,
+        }
+        positive = {pid for pid, score in judgments.items() if score > 0}
+        candidate_recall = {
+            name: (
+                len(positive.intersection(pid for pid, _ in hits)) / len(positive)
+                if positive
+                else 0.0
+            )
+            for name, hits in (
+                ("BM25", bm25_hits),
+                ("Bi-encoder", dense_hits),
+                ("RRF candidate union", rrf_hits),
+            )
+        }
+        sections = []
+        for name, hits in methods.items():
+            run = {qid: {str(pid): float(score) for pid, score in hits}}
+            query_metrics = evaluate_run({qid: judgments}, run)[qid]
+            rows = "".join(
+                f"<tr><td>{rank}</td><td>{pid}</td><td>{'relevant' if pid in positive else ''}</td>"
+                f"<td>{score:.4f}</td><td>{html.escape(backend.passages.get(pid, '[passage missing]'))}</td></tr>"
+                for rank, (pid, score) in enumerate(hits[:10], start=1)
+            )
+            sections.append(
+                f"<h4>{html.escape(name)} — MRR@10 {query_metrics['MRR@10']:.3f}, "
+                f"NDCG@10 {query_metrics['NDCG@10']:.3f}, "
+                f"Recall@10 {query_metrics['Recall@10']:.3f}, "
+                f"Recall@100 {query_metrics['Recall@100']:.3f}</h4>"
+                "<table><thead><tr><th>Rank</th><th>PID</th><th>Judgment</th>"
+                f"<th>Score</th><th>Passage</th></tr></thead><tbody>{rows}</tbody></table>"
+            )
+        bm25_top = {pid for pid, _ in bm25_hits[:10]}
+        dense_top = {pid for pid, _ in dense_hits[:10]}
+        rrf_top = {pid for pid, _ in rrf_hits[:10]}
+        overlap = (
+            f"Top-10 overlap: BM25∩bi-encoder={len(bm25_top & dense_top)}, "
+            f"BM25∩RRF={len(bm25_top & rrf_top)}, "
+            f"bi-encoder∩RRF={len(dense_top & rrf_top)}."
+        )
+        missed = sorted(positive.difference(pid for pid, _ in rrf_hits))
+        found = sorted(positive.intersection(pid for pid, _ in rrf_hits))
+        bm25_rank = {pid: rank for rank, (pid, _) in enumerate(bm25_hits, start=1)}
+        bm25_cross_rank = {
+            pid: rank for rank, (pid, _) in enumerate(bm25_cross, start=1)
+        }
+        rrf_rank = {pid: rank for rank, (pid, _) in enumerate(rrf_hits, start=1)}
+        cross_rank = {pid: rank for rank, (pid, _) in enumerate(rrf_cross, start=1)}
+        movement_rows = []
+        for pid in sorted(set(rrf_rank) | set(cross_rank), key=lambda item: (rrf_rank.get(item, 10**9), item))[:20]:
+            movement_rows.append(
+                f"<tr><td>{pid}</td><td>{bm25_rank.get(pid, '—')}</td>"
+                f"<td>{bm25_cross_rank.get(pid, '—')}</td><td>{rrf_rank.get(pid, '—')}</td>"
+                f"<td>{cross_rank.get(pid, '—')}</td></tr>"
+            )
+        return (
+            f"<h3>Judged benchmark query {html.escape(qid)}</h3>"
+            f"<p>{html.escape(query_text)}</p>"
+            f"<p>Ground-truth relevant passage IDs: {html.escape(', '.join(map(str, sorted(positive))) or 'none judged relevant')}</p>"
+            f"<p>RRF relevant found: {html.escape(', '.join(map(str, found)) or 'none')}; "
+            f"missed: {html.escape(', '.join(map(str, missed)) or 'none')}.</p>"
+            f"<p>Candidate-generation recall (separate from final ranking): "
+            f"{html.escape(json.dumps(candidate_recall, sort_keys=True))}</p>"
+            f"<p>{html.escape(overlap)}</p>"
+            "<h4>Rank movement</h4><table><thead><tr><th>PID</th><th>BM25 rank</th>"
+            f"<th>BM25 + cross-encoder rank</th><th>RRF rank</th>"
+            f"<th>RRF + cross-encoder rank</th></tr></thead><tbody>{''.join(movement_rows)}</tbody></table>"
+            + "".join(sections)
+        )
 
     theme = gr.themes.Soft(
         primary_hue="indigo",
@@ -897,7 +1211,7 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 with gr.Accordion("Settings", open=False):
                     systems = gr.CheckboxGroup(
                         choices=list(SYSTEMS), value=DEFAULT_SYSTEMS, label="Systems to compare",
-                        info="Select 1–4. Rank-movement chips are shown relative to BM25.",
+                        info="Select systems to compare. Rank-movement chips are shown relative to BM25.",
                     )
                     with gr.Row():
                         top_k = gr.Slider(3, 20, value=10, step=1, label="Results per system")
@@ -908,6 +1222,85 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
 
             with gr.Tab("Benchmarks"):
                 gr.HTML(render_benchmark())
+
+            with gr.Tab("Relevance feedback"):
+                gr.Markdown(
+                    "Mark passages explicitly as relevant or irrelevant. "
+                    "Feedback is session-local and updates a TF-IDF ranking with Rocchio's formula."
+                )
+                feedback_query = gr.Textbox(label="Feedback query")
+                feedback_fetch = gr.Button("Retrieve TF-IDF candidates")
+                feedback_candidates_out = gr.HTML()
+                feedback_state = gr.State({})
+                with gr.Row():
+                    positive_feedback = gr.CheckboxGroup(
+                        label="Relevant passages (positive feedback)", choices=[]
+                    )
+                    negative_feedback = gr.CheckboxGroup(
+                        label="Irrelevant passages (negative feedback)", choices=[]
+                    )
+                feedback_apply = gr.Button("Update ranking", variant="primary")
+                feedback_results = gr.HTML()
+                feedback_fetch.click(
+                    feedback_candidates,
+                    [feedback_query],
+                    [
+                        feedback_candidates_out,
+                        positive_feedback,
+                        negative_feedback,
+                        feedback_state,
+                    ],
+                )
+                feedback_apply.click(
+                    apply_feedback,
+                    [feedback_state, positive_feedback, negative_feedback],
+                    [feedback_results],
+                )
+
+            with gr.Tab("Query error analysis"):
+                gr.Markdown(
+                    "Select a held-out, qrels-judged test query. Live search queries have no inferred labels "
+                    "and are not included in this benchmark analysis."
+                )
+                error_filter = gr.Dropdown(
+                    choices=[
+                        "All",
+                        "Short",
+                        "Medium",
+                        "Long",
+                        "Retrieval failures",
+                        "Low ranking quality",
+                        "Hybrid improves",
+                        "Hybrid damages",
+                        "Reranking improves",
+                        "Reranking damages",
+                    ],
+                    value="All",
+                    label="Query filter",
+                )
+                initial_ids = list((backend.benchmark_queries or {}).keys())
+                error_query = gr.Dropdown(
+                    choices=[
+                        (f"{qid}: {text[:80]}", qid)
+                        for qid, text in (backend.benchmark_queries or {}).items()
+                    ],
+                    value=initial_ids[0] if initial_ids else None,
+                    label="Judged test query",
+                )
+                analyze_button = gr.Button("Analyze selected query", variant="primary")
+                error_analysis = gr.HTML(
+                    "<p>Prepared test queries and qrels are required for this analysis.</p>"
+                )
+                error_filter.change(
+                    update_error_query_choices,
+                    [error_filter],
+                    [error_query],
+                )
+                analyze_button.click(
+                    analyze_benchmark_query,
+                    [error_query],
+                    [error_analysis],
+                )
 
             with gr.Tab("How it works"):
                 gr.Markdown(HOW_IT_WORKS)

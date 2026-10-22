@@ -54,7 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Cross-encoder checkpoint directory.",
     )
     parser.add_argument("--candidate-depth", type=int, default=None)
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=100,
+        help="Number of reranked documents to write (use >=100 for Recall@100).",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--splits",
