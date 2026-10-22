@@ -305,28 +305,49 @@ replace repeated-seed experiments.
 
 ## Current comparison results
 
-No benchmark was run in this checkout: the prepared corpus, split qrels, and
-model checkpoints are not present. Historical numbers formerly listed here
-were not independently reproducible from the current checkout, and a previous
-cross-encoder Recall@100 value came from a top-10 run. It is intentionally not
-reported as Recall@100. Do not treat missing results as zero.
+Saved MS MARCO outputs have been restored under `data/processed/` and
+`artifacts/`. The comparison below is from the **750-query test split**; latency
+is the median over 200 test queries on the original Colab runtime. All listed
+runs contain a valid depth-100 result set. The qrels and query hashes in
+`artifacts/results/evaluation_manifest.json` match the restored files. Its
+effective configuration values also match `configs/config.yaml`; the raw
+configuration-file hashes differ, so retain the manifest as the record of the
+original run.
 
-| System | MRR@10 | NDCG@10 | Recall@10 | Recall@100 | MAP@10 | Latency |
-|---|---|---|---|---|---|---|
-| TF-IDF | not run | not run | not run | not run | not run | not run |
-| BM25 | not run | not run | not run | not run | not run | not run |
-| Bi-encoder | not run | not run | not run | not run | not run | not run |
-| BM25 → Cross-encoder | not run | not run | not run | not run | not run | not run |
-| Hybrid RRF | not run | not run | not run | not run | not run | not run |
-| Hybrid RRF → Cross-encoder | not run | not run | not run | not run | not run | not run |
+| System | MRR@10 | NDCG@10 | Recall@10 | Recall@100 | MAP@10 | Median latency (ms/query) |
+|---|---:|---:|---:|---:|---:|---:|
+| TF-IDF | 0.2943 | 0.3854 | 0.6910 | 0.9073 | 0.2874 | 45.96 |
+| BM25 | 0.3316 | 0.4230 | 0.7269 | 0.9087 | 0.3247 | 151.89 |
+| Bi-encoder | 0.4892 | 0.5788 | 0.8720 | 0.9820 | 0.4831 | 8.24 |
+| BM25 → Cross-encoder | 0.3970 | 0.4772 | 0.7444 | 0.9087 | 0.3902 | 272.23 |
+| Hybrid RRF | 0.4822 | 0.5687 | 0.8531 | 0.9947 | 0.4746 | 149.74 |
+| Hybrid RRF → Cross-encoder | 0.3402 | 0.4237 | 0.7086 | 0.9947 | 0.3319 | 209.05 |
+| BM25 → Cross-encoder (fixed candidates, depth 100 / rerank 50) | 0.4312 | 0.5072 | 0.7620 | 0.9087 | 0.4231 | 199.94 |
 
-Run the workflows above to create a local comparison and Pareto plot. The
-runner records query-level metrics and paired bootstrap confidence intervals
-in `artifacts/results/`. The research questions below—hybrid gain, reranking
-gain at a fixed candidate set, candidate-depth/latency trade-offs, query-type
-effects, and transfer to BEIR—remain unanswered until those artifacts exist.
-Query enhancement and user relevance feedback are evaluated separately from
-ordinary benchmark retrieval.
+These are actual saved test outputs, not newly rerun results. The run-level
+metrics, per-query scores, and ranked lists are in `artifacts/runs/`; summary
+tables, paired differences, and the plot are in `artifacts/results/`.
+`paired_differences.json` reports paired bootstrap intervals against BM25 over
+750 queries (2,000 resamples). For example, the bi-encoder's MRR@10 difference
+was +0.1575 (95% CI +0.1267 to +0.1912), and RRF's was +0.1506 (95% CI +0.1302
+to +0.1714). These intervals describe this test set and are not repeated-seed
+uncertainty estimates.
+
+The test result indicates that hybrid RRF substantially improves over BM25,
+but does not outperform the bi-encoder on MRR@10 or NDCG@10; it does achieve
+the highest Recall@100 of the listed systems. Cross-encoder reranking is not
+uniformly beneficial: the fixed BM25 candidate experiment improves MRR@10
+relative to BM25, while the RRF-generated candidate reranking result falls
+below the unreranked RRF result. The fixed-candidate depth sweep and its
+candidate recall are reported in the per-run metrics; candidate recall is not
+the same as final ranking quality.
+
+Optional query-enhancement evaluation did **not** finish in the Colab run: the
+process was killed with `SIGKILL` while the full lexical index was consuming
+memory. No query-enhancement result is reported. BEIR evaluation, relevance
+feedback evaluation, and repeated-seed runs are also not available in this
+output bundle and remain unreported. The query-length and negative-sampling
+ablations likewise have no matching result artifacts in the restored bundle.
 
 ## Gradio demo
 
