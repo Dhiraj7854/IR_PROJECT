@@ -22,6 +22,7 @@ class ToyTokenizer:
         return {
             "input_ids": torch.tensor([[len(text)] for text in texts]),
             "attention_mask": torch.ones((len(texts), 1), dtype=torch.int64),
+            "text": list(texts),
         }
 
 
@@ -36,6 +37,7 @@ def test_training_collator_returns_tokenized_tensor_batches():
 
     assert len(features) == 3
     assert all(torch.is_tensor(value) for item in features for value in item.values())
+    assert all("text" not in item for item in features)
     assert [item["input_ids"].shape for item in features] == [(2, 1)] * 3
     assert labels.shape == (2,)
 

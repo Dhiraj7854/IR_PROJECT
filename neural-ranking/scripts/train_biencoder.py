@@ -242,16 +242,26 @@ def _make_training_collator(
         ):
             raise ValueError("Training examples must have matching text columns")
 
-        sentence_features = [
-            model.tokenize([example.texts[index] for example in batch])
-            for index in range(sentence_count)
-        ]
-        if any(
-            not isinstance(value, torch.Tensor)
-            for features in sentence_features
-            for value in features.values()
-        ):
-            raise TypeError("Model tokenization must return tensors for every input")
+        sentence_features: List[Dict[str, torch.Tensor]] = []
+        for index in range(sentence_count):
+            tokenized = model.tokenize(
+                [example.texts[index] for example in batch]
+            )
+            tensor_features = {
+                key: value
+                for key, value in tokenized.items()
+                if isinstance(value, torch.Tensor)
+            }
+            if not tensor_features:
+                token_types = {
+                    key: type(value).__name__
+                    for key, value in tokenized.items()
+                }
+                raise TypeError(
+                    "Model tokenization returned no tensor inputs; "
+                    f"received value types: {token_types}"
+                )
+            sentence_features.append(tensor_features)
 
         labels = torch.tensor(
             [example.label for example in batch],
