@@ -32,7 +32,7 @@ def main() -> None:
     destination = Path(args.data_dir)
     destination.mkdir(parents=True, exist_ok=True)
     url = (
-        "https://public.ukp.informatik.tu-darmstadt.de/BEIR/datasets/"
+        "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/"
         f"{args.dataset}.zip"
     )
     util.download_and_unzip(url, str(destination))
