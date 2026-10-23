@@ -203,6 +203,16 @@ def configure_retrieval(
     return corpus_embeddings
 
 
+def set_retrieval_device(device: Union[str, torch.device]) -> None:
+    """Move the loaded encoder and cached corpus vectors to an inference device."""
+    global _CORPUS_EMBEDDINGS
+    encoder = _get_model()
+    if _CORPUS_EMBEDDINGS is None:
+        raise RuntimeError("Call configure_retrieval() before changing devices")
+    encoder.to(device)
+    _CORPUS_EMBEDDINGS = _CORPUS_EMBEDDINGS.to(device)
+
+
 def retrieve_biencoder(query: str, k: int = 100) -> List[Tuple[int, float]]:
     """Return top-k unique passage IDs by cosine similarity."""
     if k < 0:

@@ -29,9 +29,26 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import gradio as gr
 
+try:
+    import spaces
+except ImportError:
+    class _SpacesFallback:
+        """Keep local CPU development available without the Spaces package."""
+
+        @staticmethod
+        def GPU(*args, **kwargs):
+            def decorate(function):
+                return function
+
+            return decorate
+
+    spaces = _SpacesFallback()
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.hybrid import fuse_ranked_lists
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -67,6 +84,86 @@ _STOPWORDS = frozenset(
     "who whom whose why will with you your".split()
 )
 
+_NEURAL_INFERENCE: Optional[Callable[..., Dict[str, object]]] = None
+
+
+def _zerogpu_requested() -> bool:
+    return os.getenv("IR_USE_ZEROGPU", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@spaces.GPU(duration=60)
+def _run_neural_inference(
+    query: str,
+    dense_k: int,
+    candidate_pids: List[int],
+    candidate_texts: List[str],
+    run_dense: bool,
+    run_cross: bool,
+) -> Dict[str, object]:
+    if _NEURAL_INFERENCE is None:
+        raise RuntimeError("Neural inference backend has not been initialized")
+    return _NEURAL_INFERENCE(
+        query,
+        dense_k,
+        candidate_pids,
+        candidate_texts,
+        run_dense,
+        run_cross,
+    )
+
+
+def _run_neural_inference_with_fallback(
+    query: str,
+    dense_k: int,
+    candidate_pids: List[int],
+    candidate_texts: List[str],
+    run_dense: bool,
+    run_cross: bool,
+) -> Dict[str, object]:
+    if os.getenv("SPACE_ID") and not _zerogpu_requested():
+        if _NEURAL_INFERENCE is None:
+            raise RuntimeError("Neural inference backend has not been initialized")
+        logger.info("ZeroGPU is disabled; running neural inference on CPU")
+        return _NEURAL_INFERENCE(
+            query,
+            dense_k,
+            candidate_pids,
+            candidate_texts,
+            run_dense,
+            run_cross,
+            True,
+        )
+
+    try:
+        return _run_neural_inference(
+            query,
+            dense_k,
+            candidate_pids,
+            candidate_texts,
+            run_dense,
+            run_cross,
+        )
+    except RuntimeError as error:
+        if "No CUDA GPUs are available" not in str(error):
+            raise
+        if _NEURAL_INFERENCE is None:
+            raise RuntimeError("Neural inference backend has not been initialized") from error
+        logger.warning("ZeroGPU allocation unavailable; retrying this query on CPU")
+        return _NEURAL_INFERENCE(
+            query,
+            dense_k,
+            candidate_pids,
+            candidate_texts,
+            run_dense,
+            run_cross,
+            True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Backend: models and indexes (loaded lazily so the UI code stays importable)
@@ -93,33 +190,46 @@ class Backend:
         return len(self.passages)
 
 
+def _embedding_cache_path(
+    biencoder_path: Path,
+    space_data_dir: Path = Path("/data"),
+) -> Path:
+    if os.getenv("SPACE_ID") and space_data_dir.is_dir():
+        return space_data_dir / "corpus_embeddings.npy"
+    return biencoder_path / "corpus_embeddings.npy"
+
+
 def load_backend() -> Backend:
     """Load the corpus, lexical index, bi-encoder, and cross-encoder once."""
+    global _NEURAL_INFERENCE
     import pandas as pd
     import torch
 
+    from src import biencoder
     from src.baseline import build_index, get_index
     from src.biencoder import configure_retrieval, load_biencoder, retrieve_biencoder
     from src.config import load_config
     from src.crossencoder import load_crossencoder, rerank
     from src.evaluate import evaluate_run
-    from src.hybrid import fuse_ranked_lists
-
     config = load_config(PROJECT_ROOT / "configs" / "config.yaml")
     max_seq_len = config.models.max_seq_len
     corpus_path = DATA_DIR / "corpus.parquet"
     biencoder_path = ARTIFACTS_DIR / "biencoder"
     crossencoder_path = ARTIFACTS_DIR / "crossencoder"
-    embeddings_path = biencoder_path / "corpus_embeddings.npy"
+    embeddings_path = _embedding_cache_path(biencoder_path)
 
     for path, hint in [
         (corpus_path, "Run scripts/prepare_data.py first."),
         (biencoder_path, "Train or copy the bi-encoder checkpoint."),
-        (embeddings_path, "Run scripts/eval_biencoder.py once to cache embeddings."),
         (crossencoder_path, "Train or copy the cross-encoder checkpoint."),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{path} not found. {hint}")
+    if not embeddings_path.exists():
+        logger.info(
+            "No corpus embedding cache at %s; the corpus will be encoded and cached",
+            embeddings_path,
+        )
 
     corpus_df = pd.read_parquet(corpus_path)
     if corpus_df.empty or corpus_df["pid"].duplicated().any():
@@ -130,7 +240,7 @@ def load_backend() -> Backend:
     index = get_index()
     logger.info("Lexical index ready in %.2fs", time.perf_counter() - started)
 
-    encoder = load_biencoder(biencoder_path)
+    encoder = load_biencoder(biencoder_path, device="cpu")
     configure_retrieval(
         corpus_df["passage_text"].astype(str).tolist(),
         pids=corpus_df["pid"].tolist(),
@@ -138,32 +248,108 @@ def load_backend() -> Backend:
         model=encoder,
         cache_path=embeddings_path,
     )
-    cross_model, cross_tokenizer = load_crossencoder(crossencoder_path)
+    cross_model, cross_tokenizer = load_crossencoder(crossencoder_path, device="cpu")
 
     passages = dict(zip(corpus_df["pid"].astype(int), corpus_df["passage_text"].astype(str)))
-    use_cuda = next(cross_model.parameters()).device.type == "cuda"
+    passage_texts = corpus_df["passage_text"].astype(str).tolist()
+    passage_ids = corpus_df["pid"].tolist()
+
+    def _neural_inference(
+        query: str,
+        dense_k: int,
+        candidate_pids: List[int],
+        candidate_texts: List[str],
+        run_dense: bool,
+        run_cross: bool,
+        force_cpu: bool = False,
+    ) -> Dict[str, object]:
+        use_cuda = torch.cuda.is_available() and not force_cpu
+        device = "cuda" if use_cuda else "cpu"
+        outputs: Dict[str, object] = {"device": device}
+
+        try:
+            if run_dense:
+                biencoder.set_retrieval_device(device)
+            if run_cross:
+                cross_model.to(device)
+                cross_model.eval()
+
+            if run_dense:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                started = time.perf_counter()
+                dense_hits = retrieve_biencoder(query, dense_k)
+                if use_cuda:
+                    torch.cuda.synchronize()
+                outputs["dense"] = (
+                    dense_hits,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+
+            if run_cross:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                started = time.perf_counter()
+                cross_hits = rerank(
+                    query,
+                    candidate_pids,
+                    candidate_texts,
+                    k=dense_k,
+                    model=cross_model,
+                    tokenizer=cross_tokenizer,
+                    batch_size=32,
+                    max_length=max_seq_len,
+                    fp16=True,
+                )
+                if use_cuda:
+                    torch.cuda.synchronize()
+                outputs["cross"] = (
+                    cross_hits,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+            return outputs
+        finally:
+            if run_dense:
+                biencoder.set_retrieval_device("cpu")
+            if run_cross:
+                cross_model.to("cpu")
+            if use_cuda:
+                torch.cuda.empty_cache()
+
+    _NEURAL_INFERENCE = _neural_inference
+    if os.getenv("SPACE_ID"):
+        device_label = (
+            "ZeroGPU (on demand)"
+            if _zerogpu_requested()
+            else "CPU (ZeroGPU bypassed)"
+        )
+    else:
+        device_label = "CUDA on demand" if torch.cuda.is_available() else "CPU"
+
+    def _dense(query: str, k: int) -> List[Hit]:
+        response = _run_neural_inference_with_fallback(
+            query, k, [], [], True, False
+        )
+        hits, _ = response["dense"]
+        return hits
 
     def _rerank(query: str, pids: List[int], k: int) -> List[Hit]:
-        hits = rerank(
+        response = _run_neural_inference_with_fallback(
             query,
+            k,
             pids,
             [passages[p] for p in pids],
-            k=k,
-            model=cross_model,
-            tokenizer=cross_tokenizer,
-            batch_size=32,
-            max_length=max_seq_len,
-            fp16=True,
+            False,
+            True,
         )
-        if use_cuda:
-            torch.cuda.synchronize()
+        hits, _ = response["cross"]
         return hits
 
     backend = Backend(
         passages=passages,
         bm25=index.retrieve_bm25,
         tfidf=index.retrieve_tfidf,
-        dense=retrieve_biencoder,
+        dense=_dense,
         rerank=_rerank,
         feedback=lambda query, positive, negative, k: index.retrieve_tfidf_feedback(
             query,
@@ -174,7 +360,7 @@ def load_backend() -> Backend:
             beta=config.retrieval.rocchio_beta,
             gamma=config.retrieval.rocchio_gamma,
         ),
-        device="GPU" if use_cuda else "CPU",
+        device=device_label,
         rrf_k=config.retrieval.rrf_k,
     )
     query_path = DATA_DIR / "test_queries.parquet"
@@ -193,8 +379,9 @@ def load_backend() -> Backend:
     sample = list(passages)[:100]
     backend.bm25("warm up retrieval", 100)
     backend.tfidf("warm up retrieval", 10)
-    backend.dense("warm up retrieval", 10)
-    backend.rerank("warm up neural ranking", sample, 10)
+    if not os.getenv("SPACE_ID"):
+        backend.dense("warm up retrieval", 10)
+        backend.rerank("warm up neural ranking", sample, 10)
     return backend
 
 
@@ -626,8 +813,12 @@ def render_benchmark() -> str:
     if not rows:
         return (
             '<div class="bench"><div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>'
-            "<h2>No local benchmark results</h2><p>Run the evaluation commands to populate "
-            "artifacts/results/comparison_table.csv. No fallback or fabricated metrics are displayed.</p>"
+            "<h2>Benchmark results unavailable for this corpus</h2>"
+            "<p>This Space does not include verified metrics and judged queries for its bundled "
+            "corpus and checkpoints. Quality metrics require matching qrels; results from the "
+            "companion project are intentionally not shown because they use different artifacts. "
+            "Set IR_RESULTS_DIR to a directory with evaluation outputs produced for this Space "
+            "to display them here. No fallback or fabricated metrics are displayed.</p>"
             "</div></div>"
         )
     preferred_metrics = [
@@ -662,7 +853,7 @@ def render_benchmark() -> str:
         )
     pareto = _chart_card(
         "Quality vs. speed",
-        "Each point is one retriever. Favor the upper-left: higher MRR with lower query latency.",
+        "Local MS MARCO test evaluation. Favor the upper-left: higher MRR with lower query latency.",
         _render_pareto_chart(rows),
     )
     ablations = _read_ablation_tables()
@@ -681,11 +872,15 @@ def render_benchmark() -> str:
     return f"""
 <div class="bench">
   <div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>
-    <h2>How the rankers compare</h2>
-    <p>Metrics and latency are loaded from local evaluation artifacts. Query counts and validity are recorded by the evaluation runner.</p>
+    <h2>Local MS MARCO evaluation — saved results</h2>
+    <p><strong>Heads-up:</strong> these metrics were produced by the local/Colab project run on its MS MARCO test split
+    (750 queries; latency sampled on 200). They do not describe a separate Hugging Face Space unless its corpus and
+    checkpoints match. The table is a reference to this saved evaluation, not a claim about another deployment's live
+    quality or latency.</p>
   </div>
   <table><thead><tr><th>System</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>
-  <p class="fine">Best value per column highlighted. Results are loaded from local evaluation artifacts; truncated runs do not report Recall@100.</p>
+  <p class="fine">Best value per column highlighted. Results and run provenance are in the local evaluation artifacts.
+  Recall@100 is from the saved full-depth ranked runs, not top-10 outputs.</p>
   {pareto}
   <div class="bench-intro ablation-intro"><span class="eyebrow">ABLATION STUDIES</span>
     <h2>What changes the ranking?</h2>
