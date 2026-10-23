@@ -12,7 +12,28 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.eval_query_enhancement import _query_output_paths
 from src.query_enhancement import enhance_query, load_synonyms
+
+
+def test_query_output_paths_include_each_run_metrics_file_and_comparison(tmp_path):
+    paths = _query_output_paths(
+        tmp_path,
+        "bm25",
+        ["original", "normalize", "synonym"],
+        "val",
+    )
+
+    assert len(paths) == 7
+    assert [path.name for path in paths] == [
+        "query_bm25_original_val.txt",
+        "query_bm25_normalize_val.txt",
+        "query_bm25_synonym_val.txt",
+        "query_bm25_original_val.metrics.json",
+        "query_bm25_normalize_val.metrics.json",
+        "query_bm25_synonym_val.metrics.json",
+        "query_bm25_comparison_val.json",
+    ]
 
 
 def test_original_and_normalization_preserve_empty_input():

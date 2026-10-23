@@ -35,7 +35,7 @@ from src.evaluate import (
     evaluate_run,
     load_qrels,
     load_run,
-    paired_bootstrap_interval,
+    paired_bootstrap_comparisons,
 )
 from src.hybrid import fuse_ranked_lists
 
@@ -71,6 +71,16 @@ def parse_args() -> argparse.Namespace:
         "--artifacts-dir",
         default=str(PROJECT_ROOT / "artifacts"),
         help="Directory containing system runs and model checkpoints.",
+    )
+    parser.add_argument(
+        "--biencoder-model",
+        default="biencoder",
+        help="Checkpoint path, relative to --artifacts-dir or absolute.",
+    )
+    parser.add_argument(
+        "--crossencoder-model",
+        default="crossencoder",
+        help="Checkpoint path, relative to --artifacts-dir or absolute.",
     )
     parser.add_argument("--latency-queries", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -192,8 +202,12 @@ def main() -> None:
             f"required files are missing:\n{missing_list}"
         )
 
-    crossencoder_path = artifacts_dir / "crossencoder"
-    biencoder_path = artifacts_dir / "biencoder"
+    biencoder_path = Path(args.biencoder_model)
+    if not biencoder_path.is_absolute():
+        biencoder_path = artifacts_dir / biencoder_path
+    crossencoder_path = Path(args.crossencoder_model)
+    if not crossencoder_path.is_absolute():
+        crossencoder_path = artifacts_dir / crossencoder_path
     if not crossencoder_path.is_dir():
         raise FileNotFoundError(
             f"Cross-encoder checkpoint is required for latency measurement: {crossencoder_path}"
@@ -470,26 +484,10 @@ def main() -> None:
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
-    paired_differences: Dict[str, object] = {}
-    baseline_metrics = per_query_by_system.get("BM25", {})
-    for system, query_metrics in per_query_by_system.items():
-        if system == "BM25":
-            continue
-        metric_intervals = {}
-        for metric in ("MRR@10", "NDCG@10", "Recall@10", "MAP@10", "Recall@100"):
-            try:
-                metric_intervals[metric] = paired_bootstrap_interval(
-                    baseline_metrics,
-                    query_metrics,
-                    metric,
-                    seed=args.seed,
-                )
-            except ValueError:
-                continue
-        paired_differences[system] = {
-            "baseline": "BM25",
-            "comparison_minus_baseline": metric_intervals,
-        }
+    paired_differences = paired_bootstrap_comparisons(
+        per_query_by_system,
+        seed=args.seed,
+    )
     (results_dir / "paired_differences.json").write_text(
         json.dumps(paired_differences, indent=2) + "\n",
         encoding="utf-8",

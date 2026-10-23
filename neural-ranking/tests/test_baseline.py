@@ -13,7 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baseline import BaselineIndex, tokenize
+from src.baseline import (
+    BaselineIndex,
+    CompactBM25Index,
+    CompactTfidfIndex,
+    tokenize,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures — build a tiny in-memory index so tests run instantly
@@ -101,6 +106,40 @@ def test_bm25_k_unique_pids_corpus_query(mini_index):
     pids = [p for p, _ in results]
     assert len(pids) == k
     assert len(set(pids)) == k
+
+
+@pytest.mark.parametrize(
+    ("compact_type", "baseline_method"),
+    [
+        (CompactBM25Index, "retrieve_bm25"),
+        (CompactTfidfIndex, "retrieve_tfidf"),
+    ],
+)
+@pytest.mark.parametrize(
+    "query",
+    [
+        "python programming language data science",
+        "artificial artificial intelligence",
+        "wordnotpresent",
+    ],
+)
+def test_compact_index_matches_existing_lexical_index(
+    mini_index,
+    compact_type,
+    baseline_method,
+    query,
+):
+    compact = compact_type(MINI_CORPUS)
+
+    expected = getattr(mini_index, baseline_method)(query, k=10)
+    actual = compact.retrieve(query, k=10)
+
+    assert [pid for pid, _ in actual] == [pid for pid, _ in expected]
+    assert [score for _, score in actual] == pytest.approx(
+        [score for _, score in expected],
+        rel=1e-5,
+        abs=1e-6,
+    )
 
 
 # ---------------------------------------------------------------------------

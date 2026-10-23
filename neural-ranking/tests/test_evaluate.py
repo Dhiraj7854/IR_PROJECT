@@ -17,6 +17,7 @@ from src.evaluate import (
     average_metrics,
     evaluate_run,
     load_run,
+    paired_bootstrap_comparisons,
     paired_bootstrap_interval,
 )
 
@@ -126,3 +127,25 @@ def test_paired_bootstrap_is_deterministic_and_reports_comparison_minus_baseline
     assert interval == paired_bootstrap_interval(
         baseline, comparison, "MRR@10", seed=7, resamples=500
     )
+
+
+def test_paired_bootstrap_comparisons_keeps_bm25_schema_and_adds_tfidf():
+    systems = {
+        "BM25": {"1": {"MRR@10": 0.2}, "2": {"MRR@10": 0.0}},
+        "TF-IDF": {"1": {"MRR@10": 0.1}, "2": {"MRR@10": 0.0}},
+        "Bi-encoder": {"1": {"MRR@10": 0.5}, "2": {"MRR@10": 0.2}},
+    }
+
+    comparisons = paired_bootstrap_comparisons(
+        systems,
+        metrics=("MRR@10",),
+        seed=7,
+    )
+
+    assert comparisons["Bi-encoder"]["baseline"] == "BM25"
+    assert comparisons["Bi-encoder"]["comparison_minus_baseline"]["MRR@10"][
+        "mean_difference"
+    ] == pytest.approx(0.25)
+    assert comparisons["Bi-encoder"]["additional_comparisons"]["TF-IDF"][
+        "comparison_minus_baseline"
+    ]["MRR@10"]["mean_difference"] == pytest.approx(0.3)

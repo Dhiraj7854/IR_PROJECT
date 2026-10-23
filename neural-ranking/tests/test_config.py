@@ -47,7 +47,7 @@ def test_load_config_valid():
     # Models checks
     assert isinstance(cfg.models, ModelsConfig)
     assert cfg.models.biencoder_name == "sentence-transformers/all-MiniLM-L6-v2"
-    assert cfg.models.crossencoder_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert cfg.models.crossencoder_name == "cross-encoder/nli-MiniLM2-L6-H768"
     assert cfg.models.max_seq_len == 256
 
     # Training checks
@@ -75,7 +75,7 @@ def test_config_convenience_properties():
     assert cfg.query_splits.val == 750
     assert cfg.query_splits.test == 750
     assert cfg.biencoder_name == "sentence-transformers/all-MiniLM-L6-v2"
-    assert cfg.crossencoder_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert cfg.crossencoder_name == "cross-encoder/nli-MiniLM2-L6-H768"
     assert cfg.max_seq_len == 256
     assert cfg.batch_size == 64
     assert math.isclose(cfg.lr, 2.0e-5, rel_tol=1e-6)

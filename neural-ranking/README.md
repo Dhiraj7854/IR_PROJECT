@@ -123,9 +123,16 @@ python scripts/train_biencoder.py --config configs/config.yaml --data-dir data/p
 Train the explicit PyTorch cross-encoder and generate BM25 top-100 → reranked val/test runs:
 
 ```bash
-python scripts/train_crossencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/crossencoder
-python scripts/eval_crossencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --model artifacts/crossencoder --candidate-depth 100 --top-k 100 --splits val test
+python scripts/train_crossencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/crossencoder_nli --epochs 3
+python scripts/eval_crossencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts --model artifacts/crossencoder_nli --candidate-depth 100 --top-k 100 --splits val test
 ```
+
+The default initializer is `cross-encoder/nli-MiniLM2-L6-H768`. Its pretrained
+sequence-classification head is preserved; three-way NLI logits are converted
+to a relevance score using entailment minus contradiction. Query tokens are
+preserved while only the passage may be truncated. Training writes to
+`artifacts/crossencoder_nli/` by default so it does not replace the restored
+legacy checkpoint in `artifacts/crossencoder/`.
 
 The run contains the re-ranked top 100; the leading 10 entries per query are
 the top-10 ranking. Keeping 100 entries is necessary for an actual
@@ -165,9 +172,12 @@ python scripts/run_all_eval.py --config configs/config.yaml --data-dir data/proc
 The comparison runner includes depth-matched RRF and reranking runs when
 present. It excludes `Recall@100` from truncated (<100 result) runs, records
 the exact qrels file hash and run/config identifiers, and writes reproducible
-paired bootstrap confidence intervals for metric differences versus BM25 to
-`artifacts/results/paired_differences.json`. It preserves existing comparison
-files unless `--overwrite` is specified.
+paired bootstrap confidence intervals for metric differences versus both BM25
+and TF-IDF to `artifacts/results/paired_differences.json`. The legacy BM25
+comparison fields remain present for compatibility. Use
+`--biencoder-model` and `--crossencoder-model` to select checkpoints other
+than the default ones. It preserves existing comparison files unless
+`--overwrite` is specified.
 
 Outputs: `artifacts/results/comparison_table.md`, `comparison_table.csv`, `per_query_metrics.csv`, and `pareto.png`. The runner flags suspicious MRR values rather than treating them as accepted results. To inspect the table and plot interactively, open [`notebooks/02_results.ipynb`](notebooks/02_results.ipynb) from this directory after evaluation.
 
@@ -185,7 +195,13 @@ Run the random-vs-hard negative, BM25 rerank-depth, and query-length experiments
 python scripts/run_experiments.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts
 ```
 
-By default the random-negative model is retrained for two epochs. Use `--reuse-random-checkpoint` if `artifacts/biencoder_random/` already contains the trained checkpoint. The report and 150-dpi figures are written to `artifacts/results/ablations.md` and `ablations_*.png`.
+By default the random-negative model is retrained for two epochs. Use
+`--reuse-random-checkpoint` if `artifacts/biencoder_random/` already contains
+the trained checkpoint. `--biencoder-model` and `--crossencoder-model` allow
+the ablations to run against separately trained checkpoints;
+`--random-biencoder-model` selects the random-negative checkpoint. The report
+and 150-dpi figures are written to `artifacts/results/ablations.md` and
+`ablations_*.png`.
 
 ### 6. Hybrid RRF evaluation
 
@@ -241,8 +257,83 @@ python scripts/eval_query_enhancement.py --retriever bm25 --methods original spe
 ```
 
 The script saves transformed queries, ranked runs, per-query metrics, latency,
-and paired metric changes versus the original query. Enhancement is not
-enabled by default and its results are separate from the baseline.
+and paired metric changes versus the original query. It now constructs only
+the selected sparse lexical index; BM25 uses sparse term-frequency postings
+instead of retaining a large Python token list and BM25 object for every
+passage. It also builds its output-path list without mutating the list being
+iterated, which was the unbounded allocation behind the previous
+query-enhancement `MemoryError`. A full 100,000-passage / 750-query validation
+smoke test now completes locally; it is a code-path check, not a new reported
+benchmark result. Enhancement is not enabled by default and its results are
+separate from the baseline.
+
+### Colab follow-up run for the outstanding claims
+
+The saved results do not contain the requested retraining, negative-sampling,
+query-length, query-enhancement, or BEIR SciFact results. The following
+commands run those experiments without replacing the restored checkpoints or
+saved comparison outputs. Start from the Colab setup above, enable a GPU, and
+run these commands from `neural-ranking/`.
+
+Train the hard-negative bi-encoder for a longer, early-stopped run and the
+NLI-initialized cross-encoder into separate checkpoint directories:
+
+```bash
+python scripts/train_biencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/biencoder_extended --negatives hard --epochs 5 --patience 3 --seed 42
+python scripts/train_biencoder.py --config configs/config.yaml --data-dir data/processed --output-dir artifacts/biencoder_random --negatives random --epochs 5 --patience 3 --seed 42
+python scripts/train_crossencoder.py --config configs/config.yaml --data-dir data/processed --model-name cross-encoder/nli-MiniLM2-L6-H768 --output-dir artifacts/crossencoder_nli --epochs 3 --batch-size 32 --max-length 256 --seed 42
+```
+
+Create an isolated output bundle and copy the new checkpoints into it. The
+original `artifacts/biencoder/` and `artifacts/crossencoder/` remain untouched:
+
+```bash
+mkdir -p artifacts/retrained
+cp -a artifacts/biencoder_extended artifacts/retrained/
+cp -a artifacts/crossencoder_nli artifacts/retrained/
+cp -a artifacts/biencoder_random artifacts/retrained/
+python scripts/run_baseline.py --artifacts_dir artifacts/retrained --data_dir data/processed --splits val test --methods tfidf bm25 --top_k 100
+python scripts/eval_biencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --model artifacts/retrained/biencoder_extended --splits val test
+python scripts/eval_crossencoder.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --model artifacts/retrained/crossencoder_nli --candidate-depth 100 --top-k 100 --splits val test
+python scripts/eval_hybrid.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --biencoder-model artifacts/retrained/biencoder_extended --crossencoder-model artifacts/retrained/crossencoder_nli --candidate-depth 100 --rerank-depth 50 --top-k 100 --splits val test --overwrite
+python scripts/run_experiments.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --biencoder-model biencoder_extended --crossencoder-model crossencoder_nli --reuse-random-checkpoint
+python scripts/run_all_eval.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --biencoder-model biencoder_extended --crossencoder-model crossencoder_nli --latency-queries 200 --overwrite
+```
+
+Evaluate query normalization and synonym expansion on both lexical systems.
+Spelling correction is optional and requires the `query-enhancement` extra:
+
+```bash
+python scripts/eval_query_enhancement.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --retriever bm25 --methods original normalize synonym --splits val test
+python scripts/eval_query_enhancement.py --config configs/config.yaml --data-dir data/processed --artifacts-dir artifacts/retrained --retriever tfidf --methods original normalize synonym --splits val test
+```
+
+Run the zero-shot SciFact evaluation. This downloads the dataset only when the
+explicit preparation command is invoked:
+
+```bash
+python -m pip install -e ".[beir]"
+python scripts/prepare_beir.py --dataset scifact
+python scripts/eval_beir.py --dataset scifact --data-dir data/beir --artifacts-dir artifacts/retrained --biencoder-model artifacts/retrained/biencoder_extended --crossencoder-model artifacts/retrained/crossencoder_nli --candidate-depth 100 --rerank-depth 50 --top-k 100 --overwrite
+```
+
+Review `artifacts/retrained/results/` and `artifacts/retrained/beir/scifact/`
+before updating report claims. Save the generated bundle to Drive or download
+it from Colab so the per-query runs, manifests, and checkpoints can be
+reviewed together:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+```bash
+cp -a artifacts/retrained "/content/drive/MyDrive/IR_PROJECT/"
+```
+
+Do not report a new score until the corresponding run, qrels fingerprint, and
+evaluation manifest are present. A successful execution only demonstrates
+that the experiment ran; it does not establish that the new system improved.
 
 ### 9. Performance benchmark
 
@@ -300,8 +391,8 @@ are scored as zero. The standalone `evaluate.py` refuses to report
 Recall@100 from runs shorter than 100 documents. The comparison runner also
 omits it for truncated run files and marks its validity. Candidate recall is
 reported separately. `run_all_eval.py` writes paired, query-level bootstrap
-intervals for differences from BM25; intervals are descriptive and do not
-replace repeated-seed experiments.
+intervals for differences from BM25 and TF-IDF; intervals are descriptive and
+do not replace repeated-seed experiments.
 
 ## Current comparison results
 
@@ -310,28 +401,35 @@ Saved MS MARCO outputs have been restored under `data/processed/` and
 is the median over 200 test queries on the original Colab runtime. All listed
 runs contain a valid depth-100 result set. The qrels and query hashes in
 `artifacts/results/evaluation_manifest.json` match the restored files. Its
-effective configuration values also match `configs/config.yaml`; the raw
-configuration-file hashes differ, so retain the manifest as the record of the
-original run.
+manifest preserves the configuration used for the original run; it differs
+from the current configuration because the cross-encoder initializer has
+since changed. Retain the manifest as the authoritative record of the saved
+run.
 
 | System | MRR@10 | NDCG@10 | Recall@10 | Recall@100 | MAP@10 | Median latency (ms/query) |
 |---|---:|---:|---:|---:|---:|---:|
 | TF-IDF | 0.2943 | 0.3854 | 0.6910 | 0.9073 | 0.2874 | 45.96 |
 | BM25 | 0.3316 | 0.4230 | 0.7269 | 0.9087 | 0.3247 | 151.89 |
 | Bi-encoder | 0.4892 | 0.5788 | 0.8720 | 0.9820 | 0.4831 | 8.24 |
-| BM25 → Cross-encoder | 0.3970 | 0.4772 | 0.7444 | 0.9087 | 0.3902 | 272.23 |
+| BM25 → Cross-encoder (legacy) | 0.3970 | 0.4772 | 0.7444 | 0.9087 | 0.3902 | 272.23 |
 | Hybrid RRF | 0.4822 | 0.5687 | 0.8531 | 0.9947 | 0.4746 | 149.74 |
-| Hybrid RRF → Cross-encoder | 0.3402 | 0.4237 | 0.7086 | 0.9947 | 0.3319 | 209.05 |
-| BM25 → Cross-encoder (fixed candidates, depth 100 / rerank 50) | 0.4312 | 0.5072 | 0.7620 | 0.9087 | 0.4231 | 199.94 |
+| Hybrid RRF → Cross-encoder (legacy) | 0.3402 | 0.4237 | 0.7086 | 0.9947 | 0.3319 | 209.05 |
+| BM25 → Cross-encoder (fixed candidates, depth 100 / rerank 50; legacy) | 0.4312 | 0.5072 | 0.7620 | 0.9087 | 0.4231 | 199.94 |
 
-These are actual saved test outputs, not newly rerun results. The run-level
+These are actual saved test outputs, not newly rerun results. The cross-encoder
+rows use the legacy MS MARCO-initialized checkpoint, whose pretrained
+classification head was discarded by the previous trainer. Because its
+backbone was pretrained on MS MARCO, treat its test scores as exploratory,
+not as an uncontaminated held-out comparison. The current trainer instead
+defaults to an NLI-initialized sequence classifier and writes a new checkpoint
+to `artifacts/crossencoder_nli/`; its results remain pending. The run-level
 metrics, per-query scores, and ranked lists are in `artifacts/runs/`; summary
 tables, paired differences, and the plot are in `artifacts/results/`.
-`paired_differences.json` reports paired bootstrap intervals against BM25 over
-750 queries (2,000 resamples). For example, the bi-encoder's MRR@10 difference
-was +0.1575 (95% CI +0.1267 to +0.1912), and RRF's was +0.1506 (95% CI +0.1302
-to +0.1714). These intervals describe this test set and are not repeated-seed
-uncertainty estimates.
+`paired_differences.json` reports paired bootstrap intervals against both
+BM25 and TF-IDF over 750 queries (2,000 resamples). The bi-encoder's MRR@10
+difference is +0.1575 vs. BM25 (95% CI +0.1267 to +0.1912) and +0.1949 vs.
+TF-IDF (95% CI +0.1633 to +0.2265). These intervals describe this test set
+and are not repeated-seed uncertainty estimates.
 
 The test result indicates that hybrid RRF substantially improves over BM25,
 but does not outperform the bi-encoder on MRR@10 or NDCG@10; it does achieve
@@ -342,12 +440,14 @@ below the unreranked RRF result. The fixed-candidate depth sweep and its
 candidate recall are reported in the per-run metrics; candidate recall is not
 the same as final ranking quality.
 
-Optional query-enhancement evaluation did **not** finish in the Colab run: the
-process was killed with `SIGKILL` while the full lexical index was consuming
-memory. No query-enhancement result is reported. BEIR evaluation, relevance
-feedback evaluation, and repeated-seed runs are also not available in this
-output bundle and remain unreported. The query-length and negative-sampling
-ablations likewise have no matching result artifacts in the restored bundle.
+The original query-enhancement evaluation did **not** finish in Colab. A
+reproduction found an unbounded output-path list construction that raised
+`MemoryError`; the code now creates a finite path list and builds only the
+requested compact sparse lexical index. The local full-corpus validation smoke
+test completed, but no new query-enhancement benchmark result is reported.
+BEIR SciFact, longer-training, repeated-seed, query-length, and
+negative-sampling results are also pending; the README provides a Colab run
+that writes them to a separate output bundle.
 
 ## Gradio demo
 
@@ -405,4 +505,6 @@ queries tie at this maximum).
 
 ## Research report
 
-[`report_skeleton.md`](report_skeleton.md) provides the paper/report structure and required literature citations. Populate its result tables from `artifacts/results/` after the model runs complete; analysis sections are intentionally left for the project author.
+[`report_skeleton.md`](report_skeleton.md) contains the completed narrative for
+the saved results, paired TF-IDF analysis, references, limitations, and a clear
+separation between measured results and pending Colab experiments.

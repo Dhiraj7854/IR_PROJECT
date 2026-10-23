@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baseline import build_index, get_index, write_trec_run
+from src.baseline import CompactBM25Index, CompactTfidfIndex, write_trec_run
 from src.config import load_config
 from src.evaluate import average_metrics, evaluate_run, load_qrels, paired_bootstrap_interval
 from src.query_enhancement import enhance_query, load_synonyms
@@ -60,6 +60,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _query_output_paths(
+    output_dir: Path,
+    retriever: str,
+    methods: List[str],
+    split: str,
+) -> List[Path]:
+    run_paths = [
+        output_dir / f"query_{retriever}_{method}_{split}.txt"
+        for method in methods
+    ]
+    metrics_paths = [path.with_suffix(".metrics.json") for path in run_paths]
+    comparison_path = output_dir / f"query_{retriever}_comparison_{split}.json"
+    return [*run_paths, *metrics_paths, comparison_path]
+
+
 def main() -> None:
     args = parse_args()
     if args.top_k <= 0:
@@ -74,9 +89,12 @@ def main() -> None:
     if not corpus_path.is_file():
         raise FileNotFoundError(f"Corpus not found: {corpus_path}")
     corpus = pd.read_parquet(corpus_path)
-    build_index(corpus_df=corpus, artifacts_dir=artifacts_dir)
-    index = get_index()
-    retrieval = index.retrieve_bm25 if args.retriever == "bm25" else index.retrieve_tfidf
+    index = (
+        CompactBM25Index(corpus)
+        if args.retriever == "bm25"
+        else CompactTfidfIndex(corpus)
+    )
+    retrieval = index.retrieve
     synonyms = load_synonyms(Path(args.synonyms)) if "synonym" in args.methods else {}
     output_dir = artifacts_dir / "runs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -88,13 +106,13 @@ def main() -> None:
             raise FileNotFoundError(f"Missing query or qrels file for split {split}")
         queries = pd.read_parquet(queries_path)
         qrels = load_qrels(qrels_path)
-        comparison_path = output_dir / f"query_{args.retriever}_comparison_{split}.json"
-        output_files = [
-            output_dir / f"query_{args.retriever}_{method}_{split}.txt"
-            for method in args.methods
-        ]
-        output_files.extend(path.with_suffix(".metrics.json") for path in output_files)
-        output_files.append(comparison_path)
+        output_files = _query_output_paths(
+            output_dir,
+            args.retriever,
+            args.methods,
+            split,
+        )
+        comparison_path = output_files[-1]
         existing = [path for path in output_files if path.exists()]
         if existing and not args.overwrite:
             raise FileExistsError(

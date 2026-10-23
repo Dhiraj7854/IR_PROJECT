@@ -6,7 +6,7 @@ import logging
 import math
 import random
 from pathlib import Path
-from typing import Dict, Mapping, Union
+from typing import Dict, Mapping, Sequence, Union
 
 import pandas as pd
 
@@ -300,3 +300,63 @@ def paired_bootstrap_interval(
         "paired_queries": float(len(query_ids)),
         "resamples": float(resamples),
     }
+
+
+def paired_bootstrap_comparisons(
+    per_query_by_system: Mapping[str, Mapping[str, Mapping[str, float]]],
+    *,
+    baselines: Sequence[str] = ("BM25", "TF-IDF"),
+    metrics: Sequence[str] = (
+        "MRR@10",
+        "NDCG@10",
+        "Recall@10",
+        "MAP@10",
+        "Recall@100",
+    ),
+    seed: int = 42,
+) -> Dict[str, object]:
+    """Build paired intervals against the primary and additional baselines."""
+    if not baselines:
+        raise ValueError("At least one baseline system is required")
+    primary_baseline = baselines[0]
+    comparisons: Dict[str, object] = {}
+    for system, query_metrics in per_query_by_system.items():
+        if system == primary_baseline:
+            continue
+        result: Dict[str, object] = {"baseline": primary_baseline}
+        primary_metrics: Dict[str, Dict[str, float]] = {}
+        if primary_baseline in per_query_by_system:
+            for metric in metrics:
+                try:
+                    primary_metrics[metric] = paired_bootstrap_interval(
+                        per_query_by_system[primary_baseline],
+                        query_metrics,
+                        metric,
+                        seed=seed,
+                    )
+                except ValueError:
+                    continue
+        result["comparison_minus_baseline"] = primary_metrics
+
+        additional: Dict[str, object] = {}
+        for baseline in baselines[1:]:
+            if baseline == system or baseline not in per_query_by_system:
+                continue
+            metric_intervals: Dict[str, Dict[str, float]] = {}
+            for metric in metrics:
+                try:
+                    metric_intervals[metric] = paired_bootstrap_interval(
+                        per_query_by_system[baseline],
+                        query_metrics,
+                        metric,
+                        seed=seed,
+                    )
+                except ValueError:
+                    continue
+            additional[baseline] = {
+                "comparison_minus_baseline": metric_intervals,
+            }
+        if additional:
+            result["additional_comparisons"] = additional
+        comparisons[system] = result
+    return comparisons

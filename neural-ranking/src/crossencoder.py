@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -14,36 +14,122 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CROSSENCODER_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_CROSSENCODER_PATH = PROJECT_ROOT / "artifacts" / "crossencoder"
 DEFAULT_MAX_LENGTH = 256
+DEFAULT_CROSSENCODER_NAME = "cross-encoder/nli-MiniLM2-L6-H768"
+
+
+class _SequenceClassifierConfig(Protocol):
+    num_labels: int
+    id2label: Mapping[int, str]
+
+
+class _SequenceClassifierOutput(Protocol):
+    logits: torch.Tensor
+
+
+class _SequenceClassifier(Protocol):
+    config: _SequenceClassifierConfig
+
+    def __call__(self, **inputs: Any) -> _SequenceClassifierOutput: ...
+
+    def save_pretrained(self, save_directory: Union[str, Path]) -> Any: ...
+
+
+class _BackboneConfig(Protocol):
+    hidden_size: int
+
+
+class _BackboneOutput(Protocol):
+    last_hidden_state: torch.Tensor
+
+
+class _Backbone(Protocol):
+    config: _BackboneConfig
+
+    def __call__(self, **inputs: Any) -> _BackboneOutput: ...
+
+    def save_pretrained(self, save_directory: Union[str, Path]) -> Any: ...
 
 
 class CrossEncoderRanker(nn.Module):
-    """AutoModel backbone with dropout and a scalar [CLS] scoring head."""
+    """Sequence classifier adapted to a scalar query-passage relevance score."""
 
     def __init__(
         self,
         model_name_or_path: Union[str, Path] = DEFAULT_CROSSENCODER_NAME,
         dropout: float = 0.1,
         max_length: int = DEFAULT_MAX_LENGTH,
-        backbone: Optional[nn.Module] = None,
+        backbone: Optional[_Backbone] = None,
+        sequence_classifier: Optional[_SequenceClassifier] = None,
     ) -> None:
         super().__init__()
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in the range [0, 1)")
-        if backbone is None:
-            from transformers import AutoModel
+        if backbone is not None and sequence_classifier is not None:
+            raise ValueError("Pass either a legacy backbone or sequence classifier, not both")
+        if backbone is None and sequence_classifier is None:
+            from transformers import AutoModelForSequenceClassification
 
-            backbone = AutoModel.from_pretrained(str(model_name_or_path))
+            sequence_classifier = AutoModelForSequenceClassification.from_pretrained(
+                str(model_name_or_path)
+            )
+        self.sequence_classifier = sequence_classifier
         self.backbone = backbone
-        hidden_size = int(self.backbone.config.hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.scoring_head = nn.Linear(hidden_size, 1)
+        self.scoring_head: Optional[nn.Linear] = None
+        self.score_mode = "legacy_cls"
+        self.entailment_label_id: Optional[int] = None
+        self.contradiction_label_id: Optional[int] = None
+        if self.sequence_classifier is not None:
+            labels = {
+                int(label_id): str(label).strip().lower()
+                for label_id, label in self.sequence_classifier.config.id2label.items()
+            }
+            num_labels = int(self.sequence_classifier.config.num_labels)
+            if num_labels == 1:
+                self.score_mode = "single_logit"
+            elif num_labels == 3:
+                label_ids = {label: label_id for label_id, label in labels.items()}
+                if "entailment" not in label_ids or "contradiction" not in label_ids:
+                    raise ValueError(
+                        "Three-label cross-encoder initialization requires "
+                        "entailment and contradiction labels"
+                    )
+                self.score_mode = "nli_margin"
+                self.entailment_label_id = label_ids["entailment"]
+                self.contradiction_label_id = label_ids["contradiction"]
+            else:
+                raise ValueError(
+                    f"Unsupported pretrained sequence-classification head "
+                    f"with {num_labels} labels"
+                )
+        elif self.backbone is None:
+            raise RuntimeError("Cross-encoder backbone was not initialized")
+        else:
+            hidden_size = int(self.backbone.config.hidden_size)
+            self.dropout = nn.Dropout(dropout)
+            self.scoring_head = nn.Linear(hidden_size, 1)
         self.max_length = max_length
 
     def forward(self, **inputs: torch.Tensor) -> torch.Tensor:
         """Return one relevance logit for each encoded query-passage pair."""
+        if self.sequence_classifier is not None:
+            logits = self.sequence_classifier(**inputs, return_dict=True).logits
+            if self.score_mode == "single_logit":
+                return logits[:, 0]
+            if self.score_mode == "nli_margin":
+                if (
+                    self.entailment_label_id is None
+                    or self.contradiction_label_id is None
+                ):
+                    raise RuntimeError("NLI relevance labels were not initialized")
+                return (
+                    logits[:, self.entailment_label_id]
+                    - logits[:, self.contradiction_label_id]
+                )
+            raise RuntimeError(f"Unsupported sequence-classification score mode: {self.score_mode}")
+        if self.backbone is None or self.scoring_head is None:
+            raise RuntimeError("Legacy cross-encoder components were not initialized")
         outputs = self.backbone(**inputs, return_dict=True)
         cls_embedding = outputs.last_hidden_state[:, 0]
         return self.scoring_head(self.dropout(cls_embedding)).squeeze(-1)
@@ -57,12 +143,23 @@ class CrossEncoderRanker(nn.Module):
         """Save backbone, tokenizer, head, and inference settings."""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        self.backbone.save_pretrained(output_path / "backbone")
+        if self.sequence_classifier is not None:
+            self.sequence_classifier.save_pretrained(output_path / "backbone")
+        elif self.backbone is not None and self.scoring_head is not None:
+            self.backbone.save_pretrained(output_path / "backbone")
+            torch.save(self.scoring_head.state_dict(), output_path / "scoring_head.pt")
+        else:
+            raise RuntimeError("Cross-encoder components were not initialized")
         tokenizer.save_pretrained(output_path)
-        torch.save(self.scoring_head.state_dict(), output_path / "scoring_head.pt")
         metadata = {
             "dropout": dropout,
             "max_length": self.max_length,
+            "architecture": (
+                "sequence-classification"
+                if self.sequence_classifier is not None
+                else "legacy-cls"
+            ),
+            "score_mode": self.score_mode,
         }
         (output_path / "crossencoder_config.json").write_text(
             json.dumps(metadata, indent=2) + "\n",
@@ -81,16 +178,37 @@ class CrossEncoderRanker(nn.Module):
         if not metadata_path.is_file():
             raise FileNotFoundError(f"Cross-encoder metadata not found: {metadata_path}")
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("architecture") == "sequence-classification":
+            from transformers import AutoModelForSequenceClassification
+
+            classifier = AutoModelForSequenceClassification.from_pretrained(
+                model_path / "backbone"
+            )
+            model = cls(
+                dropout=float(metadata["dropout"]),
+                max_length=int(metadata["max_length"]),
+                sequence_classifier=classifier,
+            )
+            if model.score_mode != metadata.get("score_mode"):
+                raise ValueError(
+                    "Saved cross-encoder score mode does not match its classifier labels"
+                )
+            return model
+
+        from transformers import AutoModel
+
         model = cls(
-            model_path / "backbone",
             dropout=float(metadata["dropout"]),
             max_length=int(metadata["max_length"]),
+            backbone=AutoModel.from_pretrained(model_path / "backbone"),
         )
         state = torch.load(
             model_path / "scoring_head.pt",
             map_location=map_location or "cpu",
             weights_only=True,
         )
+        if model.scoring_head is None:
+            raise RuntimeError("Legacy cross-encoder scoring head was not initialized")
         model.scoring_head.load_state_dict(state)
         return model
 
@@ -162,7 +280,7 @@ def rerank(
             encoded = passage_tokenizer(
                 [query] * len(batch_texts),
                 list(batch_texts),
-                truncation=True,
+                truncation="only_second",
                 max_length=limit,
                 padding=True,
                 return_tensors="pt",
