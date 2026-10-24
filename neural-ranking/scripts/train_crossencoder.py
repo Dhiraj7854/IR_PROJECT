@@ -67,11 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         default=None,
-        help="Initialization checkpoint; defaults to MS MARCO MiniLM.",
+        help="Initialization checkpoint; defaults to the configured NLI MiniLM.",
     )
     parser.add_argument(
         "--output-dir",
-        default=str(PROJECT_ROOT / "artifacts/crossencoder"),
+        default=str(PROJECT_ROOT / "artifacts/crossencoder_nli"),
         help="Best checkpoint output directory.",
     )
     parser.add_argument("--batch-size", type=int, default=32)
@@ -190,7 +190,7 @@ def make_collate_fn(tokenizer: Any, max_length: int):
         encoded = tokenizer(
             queries,
             passages,
-            truncation=True,
+            truncation="only_second",
             max_length=max_length,
             padding=True,
             return_tensors="pt",

@@ -10,7 +10,7 @@ import math
 import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -225,6 +225,53 @@ def _create_training_examples(
     return examples
 
 
+def _make_training_collator(
+    model: Any,
+) -> Callable[[List[Any]], Tuple[List[Dict[str, torch.Tensor]], torch.Tensor]]:
+    """Tokenize each query/positive/negative column into model input tensors."""
+
+    def collate(
+        batch: List[Any],
+    ) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor]:
+        if not batch:
+            raise ValueError("Cannot collate an empty training batch")
+
+        sentence_count = len(batch[0].texts)
+        if sentence_count == 0 or any(
+            len(example.texts) != sentence_count for example in batch
+        ):
+            raise ValueError("Training examples must have matching text columns")
+
+        sentence_features: List[Dict[str, torch.Tensor]] = []
+        for index in range(sentence_count):
+            tokenized = model.tokenize(
+                [example.texts[index] for example in batch]
+            )
+            tensor_features = {
+                key: value
+                for key, value in tokenized.items()
+                if isinstance(value, torch.Tensor)
+            }
+            if not tensor_features:
+                token_types = {
+                    key: type(value).__name__
+                    for key, value in tokenized.items()
+                }
+                raise TypeError(
+                    "Model tokenization returned no tensor inputs; "
+                    f"received value types: {token_types}"
+                )
+            sentence_features.append(tensor_features)
+
+        labels = torch.tensor(
+            [example.label for example in batch],
+            dtype=torch.float32,
+        )
+        return sentence_features, labels
+
+    return collate
+
+
 def main() -> None:
     args = parse_args()
     from sentence_transformers import SentenceTransformer
@@ -304,7 +351,7 @@ def main() -> None:
         examples,
         shuffle=True,
         batch_size=batch_size,
-        collate_fn=model.smart_batching_collate,
+        collate_fn=_make_training_collator(model),
         drop_last=len(examples) % batch_size == 1,
     )
     if not len(train_loader):

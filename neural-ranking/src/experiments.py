@@ -27,6 +27,7 @@ def sample_random_negative_texts(
         raise ValueError("Corpus pid and passage_text values must not be null")
     if corpus_df["pid"].duplicated().any():
         raise ValueError("Corpus passage IDs must be unique")
+    positive_pids = [int(pid) for pid in positive_pids]
 
     usable_corpus = corpus_df[
         corpus_df["passage_text"].astype(str).str.strip().ne("")

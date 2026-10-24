@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.evaluate import average_metrics, evaluate_run, load_qrels
+from src.evaluate import average_metrics, evaluate_run, load_qrels, load_run
 
 _METRIC_ALIASES = {
     "mrr@10": "MRR@10",
@@ -22,8 +22,12 @@ _METRIC_ALIASES = {
     "ndcg_cut_10": "NDCG@10",
     "p@5": "P@5",
     "precision_5": "P@5",
+    "recall@10": "Recall@10",
+    "recall_10": "Recall@10",
     "recall@100": "Recall@100",
     "recall_100": "Recall@100",
+    "map@10": "MAP@10",
+    "map_cut_10": "MAP@10",
 }
 
 
@@ -48,7 +52,14 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         nargs="+",
         choices=sorted(_METRIC_ALIASES),
-        default=["mrr@10", "ndcg@10", "p@5", "recall@100"],
+        default=[
+            "mrr@10",
+            "ndcg@10",
+            "p@5",
+            "recall@10",
+            "recall@100",
+            "map@10",
+        ],
         help="Metrics to include (accepted aliases map to the project's fixed cutoffs).",
     )
     parser.add_argument(
@@ -63,9 +74,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Evaluate the run and write per-query and average JSON results."""
     args = parse_args()
-    per_query = evaluate_run(load_qrels(args.qrels_file), args.run_file)
-    averages = average_metrics(per_query)
+    parsed_run = load_run(args.run_file)
     metric_names = list(dict.fromkeys(_METRIC_ALIASES[name] for name in args.metrics))
+    if "Recall@100" in metric_names:
+        truncated = [
+            (qid, len(documents))
+            for qid, documents in parsed_run.items()
+            if documents and len(documents) < 100
+        ]
+        if truncated:
+            raise ValueError(
+                "Cannot report Recall@100 from a run truncated below rank 100; "
+                f"examples (query ID, run depth): {truncated[:5]}. Regenerate the run "
+                "with at least 100 ranked results per query or omit Recall@100."
+            )
+    per_query = evaluate_run(load_qrels(args.qrels_file), parsed_run)
+    averages = average_metrics(per_query)
     result: Dict[str, object] = {
         "metrics": metric_names,
         "per_query": {

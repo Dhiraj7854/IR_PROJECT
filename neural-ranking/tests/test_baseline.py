@@ -13,7 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baseline import BaselineIndex, tokenize
+from src.baseline import (
+    BaselineIndex,
+    CompactBM25Index,
+    CompactTfidfIndex,
+    tokenize,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures — build a tiny in-memory index so tests run instantly
@@ -103,6 +108,40 @@ def test_bm25_k_unique_pids_corpus_query(mini_index):
     assert len(set(pids)) == k
 
 
+@pytest.mark.parametrize(
+    ("compact_type", "baseline_method"),
+    [
+        (CompactBM25Index, "retrieve_bm25"),
+        (CompactTfidfIndex, "retrieve_tfidf"),
+    ],
+)
+@pytest.mark.parametrize(
+    "query",
+    [
+        "python programming language data science",
+        "artificial artificial intelligence",
+        "wordnotpresent",
+    ],
+)
+def test_compact_index_matches_existing_lexical_index(
+    mini_index,
+    compact_type,
+    baseline_method,
+    query,
+):
+    compact = compact_type(MINI_CORPUS)
+
+    expected = getattr(mini_index, baseline_method)(query, k=10)
+    actual = compact.retrieve(query, k=10)
+
+    assert [pid for pid, _ in actual] == [pid for pid, _ in expected]
+    assert [score for _, score in actual] == pytest.approx(
+        [score for _, score in expected],
+        rel=1e-5,
+        abs=1e-6,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Relevance: top result should make topical sense
 # ---------------------------------------------------------------------------
@@ -178,6 +217,28 @@ def test_cache_is_rebuilt_for_changed_corpus(tmp_path):
     rebuilt.build(changed_corpus, artifacts_dir=tmp_path)
 
     assert rebuilt.retrieve_bm25("orchards apples", k=1)[0][0] == 2
+
+
+def test_rocchio_feedback_moves_relevant_passage_up(mini_index):
+    before = mini_index.retrieve_tfidf("programming", k=20)
+    after = mini_index.retrieve_tfidf_feedback(
+        "programming",
+        relevant_pids=[3],
+        irrelevant_pids=[2],
+        k=20,
+    )
+    before_rank = [pid for pid, _ in before].index(3)
+    after_rank = [pid for pid, _ in after].index(3)
+
+    assert after_rank <= before_rank
+    assert after[0][0] == 3
+
+
+def test_rocchio_rejects_duplicate_or_conflicting_feedback(mini_index):
+    with pytest.raises(ValueError, match="unique"):
+        mini_index.retrieve_tfidf_feedback("python", [2, 2], k=5)
+    with pytest.raises(ValueError, match="both relevant and irrelevant"):
+        mini_index.retrieve_tfidf_feedback("python", [2], [2], k=5)
 
 
 # ---------------------------------------------------------------------------

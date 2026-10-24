@@ -206,8 +206,8 @@ def download_and_sample_msmarco(
 
     # Convert to sorted list and trim to exact corpus_size
     # Prioritize needed relevant passages so none are dropped
-    other_passages = list(unique_passages - needed_relevant_passages)
-    needed_list = list(needed_relevant_passages)
+    other_passages = sorted(unique_passages - needed_relevant_passages)
+    needed_list = sorted(needed_relevant_passages)
     remaining_slots = corpus_size - len(needed_list)
     final_passages = needed_list + other_passages[:remaining_slots]
 

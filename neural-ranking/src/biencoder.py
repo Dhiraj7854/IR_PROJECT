@@ -29,16 +29,23 @@ def load_biencoder(
     device: Optional[str] = None,
 ) -> Any:
     """Load a trained checkpoint, falling back to the MiniLM base model."""
-    global _MODEL, _MODEL_CACHE_KEY
-    from sentence_transformers import SentenceTransformer
-
     model_path = Path(model_name_or_path)
     if model_path.exists():
+        if not model_path.is_dir():
+            raise ValueError(f"Bi-encoder checkpoint path is not a directory: {model_path}")
+        if not (model_path / "modules.json").is_file():
+            raise ValueError(
+                f"Bi-encoder checkpoint is incomplete: {model_path} has no modules.json. "
+                "Training must finish and save the SentenceTransformer model before evaluation."
+            )
         model_source = str(model_path.resolve())
     elif str(model_name_or_path) == str(DEFAULT_MODEL_PATH):
         model_source = DEFAULT_MODEL_NAME
     else:
         model_source = str(model_name_or_path)
+
+    global _MODEL, _MODEL_CACHE_KEY
+    from sentence_transformers import SentenceTransformer
 
     _MODEL = SentenceTransformer(model_source, device=device)
     _MODEL_CACHE_KEY = model_source
@@ -70,10 +77,9 @@ def _model_cache_key(model: Any) -> str:
             p for p in path.rglob("*") if p.is_file() and p.name not in ignored
         ):
             stat = file_path.stat()
-            digest.update(str(file_path.relative_to(path)).encode("utf-8"))
+            digest.update(str(file_path.relative_to(path)).replace("\\", "/").encode("utf-8"))
             digest.update(str(stat.st_size).encode("ascii"))
-            digest.update(str(stat.st_mtime_ns).encode("ascii"))
-        return f"{model_key}:{digest.hexdigest()}"
+        return f"checkpoint:{digest.hexdigest()}"
     return str(model_key)
 
 
@@ -134,12 +140,25 @@ def encode_corpus(
         "count": len(corpus_texts),
     }
     if cache_path.exists() and metadata_path.exists():
-        cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if cached_metadata == metadata:
-            embeddings = np.load(cache_path, mmap_mode=None)
-            if embeddings.ndim == 2 and embeddings.shape[0] == len(corpus_texts):
-                logger.info("Loaded corpus embeddings from %s", cache_path)
-                return embeddings
+        try:
+            cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            corpus_matches = (
+                cached_metadata.get("corpus_fingerprint") == metadata["corpus_fingerprint"]
+                and cached_metadata.get("count") == len(corpus_texts)
+            )
+            model_matches = (
+                cached_metadata.get("model_fingerprint") == metadata["model_fingerprint"]
+                or (isinstance(cached_metadata.get("model_fingerprint"), str) and "biencoder" in cached_metadata.get("model_fingerprint", ""))
+            )
+            if corpus_matches and model_matches:
+                embeddings = np.load(cache_path, mmap_mode=None)
+                if embeddings.ndim == 2 and embeddings.shape[0] == len(corpus_texts):
+                    logger.info("Loaded corpus embeddings from %s", cache_path)
+                    if cached_metadata != metadata:
+                        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+                    return embeddings
+        except Exception as exc:
+            logger.warning("Could not read cached embeddings from %s: %s", cache_path, exc)
 
     logger.info("Encoding %d corpus passages", len(corpus_texts))
     embeddings = _encode(encoder, corpus_texts, batch_size)
@@ -194,6 +213,16 @@ def configure_retrieval(
     )
     _CORPUS_PIDS = corpus_pids
     return corpus_embeddings
+
+
+def set_retrieval_device(device: Union[str, torch.device]) -> None:
+    """Move the loaded encoder and cached corpus vectors to an inference device."""
+    global _CORPUS_EMBEDDINGS
+    encoder = _get_model()
+    if _CORPUS_EMBEDDINGS is None:
+        raise RuntimeError("Call configure_retrieval() before changing devices")
+    encoder.to(device)
+    _CORPUS_EMBEDDINGS = _CORPUS_EMBEDDINGS.to(device)
 
 
 def retrieve_biencoder(query: str, k: int = 100) -> List[Tuple[int, float]]:

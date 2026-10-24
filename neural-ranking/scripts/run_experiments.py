@@ -66,6 +66,21 @@ def parse_args() -> argparse.Namespace:
         default=str(PROJECT_ROOT / "artifacts"),
         help="Directory containing trained models and generated artifacts.",
     )
+    parser.add_argument(
+        "--biencoder-model",
+        default="biencoder",
+        help="Hard-negative bi-encoder checkpoint relative to --artifacts-dir or absolute.",
+    )
+    parser.add_argument(
+        "--crossencoder-model",
+        default="crossencoder",
+        help="Cross-encoder checkpoint relative to --artifacts-dir or absolute.",
+    )
+    parser.add_argument(
+        "--random-biencoder-model",
+        default="biencoder_random",
+        help="Random-negative bi-encoder checkpoint relative to --artifacts-dir or absolute.",
+    )
     parser.add_argument("--biencoder-batch-size", type=int, default=64)
     parser.add_argument("--crossencoder-batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -348,9 +363,15 @@ def run_experiments(args: argparse.Namespace) -> Path:
     ):
         raise ValueError("Validation and test query IDs must be unique")
 
-    hard_checkpoint = artifacts_dir / "biencoder"
-    random_checkpoint = artifacts_dir / "biencoder_random"
-    crossencoder_checkpoint = artifacts_dir / "crossencoder"
+    hard_checkpoint = Path(args.biencoder_model)
+    if not hard_checkpoint.is_absolute():
+        hard_checkpoint = artifacts_dir / hard_checkpoint
+    random_checkpoint = Path(args.random_biencoder_model)
+    if not random_checkpoint.is_absolute():
+        random_checkpoint = artifacts_dir / random_checkpoint
+    crossencoder_checkpoint = Path(args.crossencoder_model)
+    if not crossencoder_checkpoint.is_absolute():
+        crossencoder_checkpoint = artifacts_dir / crossencoder_checkpoint
     if not hard_checkpoint.is_dir():
         raise FileNotFoundError(
             f"Train the hard-negative bi-encoder first: {hard_checkpoint}"

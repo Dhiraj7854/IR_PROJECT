@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import pickle
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from rank_bm25 import BM25Okapi
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.feature_extraction.text import (
+    ENGLISH_STOP_WORDS,
+    CountVectorizer,
+    TfidfVectorizer,
+)
+from sklearn.preprocessing import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,131 @@ def _top_k_indices(scores: np.ndarray, k: int) -> np.ndarray:
     return candidates[np.lexsort((candidates, -scores[candidates]))]
 
 
+def _compact_corpus_arrays(corpus_df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    required_columns = {"pid", "passage_text"}
+    missing_columns = required_columns.difference(corpus_df.columns)
+    if missing_columns:
+        raise ValueError(f"Corpus is missing required columns: {sorted(missing_columns)}")
+    if corpus_df.empty:
+        raise ValueError("Cannot build a retrieval index from an empty corpus")
+    if corpus_df[["pid", "passage_text"]].isna().any().any():
+        raise ValueError("Corpus pid and passage_text values must not be null")
+    if corpus_df["pid"].duplicated().any():
+        raise ValueError("Corpus passage IDs must be unique")
+    return (
+        corpus_df["pid"].to_numpy(dtype=np.int64),
+        corpus_df["passage_text"].astype(str).tolist(),
+    )
+
+
+class CompactBM25Index:
+    """Sparse BM25 index without the large Python-object tokenized corpus."""
+
+    def __init__(
+        self,
+        corpus_df: pd.DataFrame,
+        *,
+        k1: float = 1.5,
+        b: float = 0.75,
+        epsilon: float = 0.25,
+    ) -> None:
+        if (
+            not math.isfinite(k1)
+            or k1 <= 0
+            or not 0.0 <= b <= 1.0
+            or not math.isfinite(epsilon)
+            or epsilon < 0
+        ):
+            raise ValueError("Invalid BM25 parameters")
+        self._pids, texts = _compact_corpus_arrays(corpus_df)
+        self._vectorizer = CountVectorizer(
+            tokenizer=tokenize,
+            token_pattern=None,
+            lowercase=False,
+            dtype=np.int32,
+        )
+        counts = sp.csr_matrix(
+            self._vectorizer.fit_transform(texts),
+            dtype=np.int32,
+        )
+        self._postings = sp.csc_matrix(counts)
+        self._document_lengths = np.asarray(
+            counts.sum(axis=1),
+            dtype=np.float64,
+        ).ravel()
+        self._average_document_length = float(self._document_lengths.mean())
+        if self._average_document_length <= 0:
+            raise ValueError("Cannot build BM25 index: corpus contains no indexable terms")
+        document_frequencies = np.diff(self._postings.indptr).astype(np.float64)
+        document_count = len(self._pids)
+        idf = np.log(document_count - document_frequencies + 0.5) - np.log(
+            document_frequencies + 0.5
+        )
+        average_idf = float(idf.sum() / len(idf))
+        idf[idf < 0] = epsilon * average_idf
+        self._idf = idf
+        self._k1 = k1
+        self._b = b
+
+    def retrieve(self, query: str, k: int = 100) -> List[Tuple[int, float]]:
+        """Return BM25-ranked passage IDs and scores."""
+        if k < 0:
+            raise ValueError("k must be non-negative")
+        scores = np.zeros(len(self._pids), dtype=np.float64)
+        vocabulary = self._vectorizer.vocabulary_
+        for term in tokenize(query):
+            column = vocabulary.get(term)
+            if column is None:
+                continue
+            start, end = self._postings.indptr[column : column + 2]
+            rows = self._postings.indices[start:end]
+            term_frequencies = self._postings.data[start:end].astype(np.float64)
+            lengths = self._document_lengths[rows]
+            denominator = term_frequencies + self._k1 * (
+                1.0
+                - self._b
+                + self._b * lengths / self._average_document_length
+            )
+            scores[rows] += (
+                self._idf[column]
+                * term_frequencies
+                * (self._k1 + 1.0)
+                / denominator
+            )
+        top_indices = _top_k_indices(scores, k)
+        return [
+            (int(self._pids[index]), float(scores[index]))
+            for index in top_indices
+        ]
+
+
+class CompactTfidfIndex:
+    """TF-IDF-only index that avoids constructing an unused BM25 object."""
+
+    def __init__(self, corpus_df: pd.DataFrame) -> None:
+        self._pids, texts = _compact_corpus_arrays(corpus_df)
+        self._vectorizer = TfidfVectorizer(
+            lowercase=True,
+            strip_accents="unicode",
+            stop_words="english",
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        self._matrix = sp.csr_matrix(self._vectorizer.fit_transform(texts))
+
+    def retrieve(self, query: str, k: int = 100) -> List[Tuple[int, float]]:
+        """Return cosine-ranked passage IDs and scores."""
+        if k < 0:
+            raise ValueError("k must be non-negative")
+        query_vector = self._vectorizer.transform([query])
+        scores = (query_vector @ self._matrix.T).toarray().ravel()
+        top_indices = _top_k_indices(scores, k)
+        return [
+            (int(self._pids[index]), float(scores[index]))
+            for index in top_indices
+        ]
+
+
 # ---------------------------------------------------------------------------
 # BaselineIndex — builds and owns both indexes
 # ---------------------------------------------------------------------------
@@ -88,6 +219,7 @@ class BaselineIndex:
 
         # Shared pid array (row i → pid)
         self._pids: Optional[np.ndarray] = None
+        self._pid_to_row: Optional[Dict[int, int]] = None
 
         self._built = False
 
@@ -141,6 +273,9 @@ class BaselineIndex:
                 self._bm25 = state["bm25"]
                 self._tokenized_corpus = state["tokenized_corpus"]
                 self._pids = state["pids"]
+                self._pid_to_row = {
+                    int(pid): row for row, pid in enumerate(self._pids)
+                }
                 self._built = True
                 elapsed = time.perf_counter() - total_started
                 logger.info("Cached retrieval indexes loaded in %.2fs", elapsed)
@@ -152,6 +287,9 @@ class BaselineIndex:
             logger.info("Index cache does not match the corpus; rebuilding it")
 
         self._pids = corpus_df["pid"].to_numpy(dtype=np.int64)
+        self._pid_to_row = {
+            int(pid): row for row, pid in enumerate(self._pids)
+        }
         texts = corpus_df["passage_text"].astype(str).tolist()
 
         logger.info("Building TF-IDF index over %d passages", len(corpus_df))
@@ -242,6 +380,57 @@ class BaselineIndex:
         top_idx = _top_k_indices(scores, k)
         return [(int(self._pids[i]), float(scores[i])) for i in top_idx]
 
+    def retrieve_tfidf_feedback(
+        self,
+        query: str,
+        relevant_pids: Sequence[int],
+        irrelevant_pids: Sequence[int] = (),
+        k: int = 100,
+        *,
+        alpha: float = 1.0,
+        beta: float = 0.75,
+        gamma: float = 0.15,
+    ) -> List[Tuple[int, float]]:
+        """Rank with a transparent Rocchio query updated by explicit feedback."""
+        self._check_built()
+        if self._vectorizer is None or self._tfidf_matrix is None or self._pids is None:
+            raise RuntimeError("TF-IDF index state is incomplete")
+        if self._pid_to_row is None:
+            raise RuntimeError("TF-IDF passage ID mapping is unavailable")
+        if k < 0:
+            raise ValueError("k must be non-negative")
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (alpha, beta, gamma)
+        ):
+            raise ValueError("Rocchio parameters must be finite and non-negative")
+        positives = [int(pid) for pid in relevant_pids]
+        negatives = [int(pid) for pid in irrelevant_pids]
+        if len(set(positives)) != len(positives):
+            raise ValueError("Relevant feedback passage IDs must be unique")
+        if len(set(negatives)) != len(negatives):
+            raise ValueError("Irrelevant feedback passage IDs must be unique")
+        if set(positives).intersection(negatives):
+            raise ValueError("A passage cannot be both relevant and irrelevant")
+        unknown = (set(positives) | set(negatives)).difference(self._pid_to_row)
+        if unknown:
+            raise ValueError(f"Feedback passage IDs are not in the corpus: {sorted(unknown)}")
+        if k == 0:
+            return []
+
+        query_vector = self._vectorizer.transform([query]).tocsr()
+        updated_query = query_vector.multiply(alpha)
+        if positives:
+            positive_rows = [self._pid_to_row[pid] for pid in positives]
+            updated_query = updated_query + beta * self._tfidf_matrix[positive_rows].mean(axis=0)
+        if negatives:
+            negative_rows = [self._pid_to_row[pid] for pid in negatives]
+            updated_query = updated_query - gamma * self._tfidf_matrix[negative_rows].mean(axis=0)
+        updated_query = normalize(sp.csr_matrix(updated_query), norm="l2")
+        scores = (updated_query @ self._tfidf_matrix.T).toarray().ravel()
+        top_idx = _top_k_indices(scores, k)
+        return [(int(self._pids[i]), float(scores[i])) for i in top_idx]
+
 
 # ---------------------------------------------------------------------------
 # Module-level convenience API (lazy singleton)
@@ -291,6 +480,28 @@ def retrieve_tfidf(query: str, k: int = 100) -> List[Tuple[int, float]]:
 def retrieve_bm25(query: str, k: int = 100) -> List[Tuple[int, float]]:
     """Module-level BM25 retrieval using the cached singleton index."""
     return get_index().retrieve_bm25(query, k)
+
+
+def retrieve_tfidf_feedback(
+    query: str,
+    relevant_pids: Sequence[int],
+    irrelevant_pids: Sequence[int] = (),
+    k: int = 100,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.75,
+    gamma: float = 0.15,
+) -> List[Tuple[int, float]]:
+    """Module-level TF-IDF retrieval with explicit Rocchio feedback."""
+    return get_index().retrieve_tfidf_feedback(
+        query,
+        relevant_pids,
+        irrelevant_pids,
+        k,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+    )
 
 
 # ---------------------------------------------------------------------------

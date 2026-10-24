@@ -22,6 +22,7 @@ from src.config import (
     RetrievalConfig,
     TrainingConfig,
     load_config,
+    _coerce_bool,
 )
 
 
@@ -46,7 +47,7 @@ def test_load_config_valid():
     # Models checks
     assert isinstance(cfg.models, ModelsConfig)
     assert cfg.models.biencoder_name == "sentence-transformers/all-MiniLM-L6-v2"
-    assert cfg.models.crossencoder_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert cfg.models.crossencoder_name == "cross-encoder/nli-MiniLM2-L6-H768"
     assert cfg.models.max_seq_len == 256
 
     # Training checks
@@ -74,7 +75,7 @@ def test_config_convenience_properties():
     assert cfg.query_splits.val == 750
     assert cfg.query_splits.test == 750
     assert cfg.biencoder_name == "sentence-transformers/all-MiniLM-L6-v2"
-    assert cfg.crossencoder_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert cfg.crossencoder_name == "cross-encoder/nli-MiniLM2-L6-H768"
     assert cfg.max_seq_len == 256
     assert cfg.batch_size == 64
     assert math.isclose(cfg.lr, 2.0e-5, rel_tol=1e-6)
@@ -82,6 +83,13 @@ def test_config_convenience_properties():
     assert cfg.stage1_top_k == 100
     assert cfg.top_k_stage1 == 100
     assert cfg.rerank_depth == 50
+
+
+def test_boolean_configuration_parsing_handles_false_strings_and_invalid_values():
+    assert _coerce_bool("false", default=True) is False
+    assert _coerce_bool("yes") is True
+    with pytest.raises(ValueError, match="Invalid boolean"):
+        _coerce_bool("perhaps")
 
 
 def test_load_config_file_not_found():

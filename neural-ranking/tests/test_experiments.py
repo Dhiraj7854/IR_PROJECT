@@ -83,3 +83,18 @@ def test_random_negatives_are_deterministic_and_exclude_positive_pids():
     assert first == second
     assert first[0] != "positive one"
     assert first[1] != "positive three"
+
+
+def test_random_negatives_allow_repeated_positive_pids_across_triplets():
+    corpus = pd.DataFrame(
+        {
+            "pid": [1, 2, 3],
+            "passage_text": ["positive", "random two", "random three"],
+        }
+    )
+
+    negatives = sample_random_negative_texts(corpus, [1, 1, 2], seed=7)
+
+    assert len(negatives) == 3
+    assert all(text != "positive" for text in negatives[:2])
+    assert negatives[2] != "random two"
