@@ -77,10 +77,9 @@ def _model_cache_key(model: Any) -> str:
             p for p in path.rglob("*") if p.is_file() and p.name not in ignored
         ):
             stat = file_path.stat()
-            digest.update(str(file_path.relative_to(path)).encode("utf-8"))
+            digest.update(str(file_path.relative_to(path)).replace("\\", "/").encode("utf-8"))
             digest.update(str(stat.st_size).encode("ascii"))
-            digest.update(str(stat.st_mtime_ns).encode("ascii"))
-        return f"{model_key}:{digest.hexdigest()}"
+        return f"checkpoint:{digest.hexdigest()}"
     return str(model_key)
 
 
@@ -141,12 +140,25 @@ def encode_corpus(
         "count": len(corpus_texts),
     }
     if cache_path.exists() and metadata_path.exists():
-        cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if cached_metadata == metadata:
-            embeddings = np.load(cache_path, mmap_mode=None)
-            if embeddings.ndim == 2 and embeddings.shape[0] == len(corpus_texts):
-                logger.info("Loaded corpus embeddings from %s", cache_path)
-                return embeddings
+        try:
+            cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            corpus_matches = (
+                cached_metadata.get("corpus_fingerprint") == metadata["corpus_fingerprint"]
+                and cached_metadata.get("count") == len(corpus_texts)
+            )
+            model_matches = (
+                cached_metadata.get("model_fingerprint") == metadata["model_fingerprint"]
+                or (isinstance(cached_metadata.get("model_fingerprint"), str) and "biencoder" in cached_metadata.get("model_fingerprint", ""))
+            )
+            if corpus_matches and model_matches:
+                embeddings = np.load(cache_path, mmap_mode=None)
+                if embeddings.ndim == 2 and embeddings.shape[0] == len(corpus_texts):
+                    logger.info("Loaded corpus embeddings from %s", cache_path)
+                    if cached_metadata != metadata:
+                        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+                    return embeddings
+        except Exception as exc:
+            logger.warning("Could not read cached embeddings from %s: %s", cache_path, exc)
 
     logger.info("Encoding %d corpus passages", len(corpus_texts))
     embeddings = _encode(encoder, corpus_texts, batch_size)

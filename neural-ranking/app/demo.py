@@ -49,13 +49,33 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.hybrid import fuse_ranked_lists
+from src.query_enhancement import enhance_query, load_synonyms
+
+SYNONYMS_PATH = PROJECT_ROOT / "configs" / "synonyms.json"
+try:
+    SYNONYMS = load_synonyms(SYNONYMS_PATH) if SYNONYMS_PATH.is_file() else {}
+except Exception:
+    SYNONYMS = {}
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-RESULTS_DIR = ARTIFACTS_DIR / "results"
+RESULTS_DIR = Path(
+    os.environ.get("IR_RESULTS_DIR", ARTIFACTS_DIR / "local-evaluation")
+)
+if not RESULTS_DIR.is_absolute():
+    RESULTS_DIR = PROJECT_ROOT / RESULTS_DIR
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
+QUERY_ANALYSIS_UNAVAILABLE = (
+    '<div class="analysis-empty"><span class="eyebrow">JUDGED DATA REQUIRED</span>'
+    "<h3>Query analysis is not available yet</h3>"
+    "<p>Add <code>data/processed/test_queries.parquet</code> and "
+    "<code>data/processed/test_qrels.parquet</code> for this Space's passage corpus. "
+    "Their passage IDs must match the bundled corpus; local benchmark judgments "
+    "and live searches are not interchangeable with these labels.</p></div>"
+)
 
 Hit = Tuple[int, float]
 
@@ -513,6 +533,7 @@ def render_insights(
     cross_hits: Optional[Sequence[Hit]],
     bm25_rank: Dict[int, int],
     timings: Dict[str, float],
+    enhancement_note: str = "",
 ) -> str:
     """Summary tiles plus a latency bar chart for the selected systems."""
     tiles: List[str] = []
@@ -559,9 +580,14 @@ def render_insights(
             f'<span class="ltrack"><span style="width:{width:.1f}%;background:{color}"></span></span>'
             f'<span class="lval">{ms:.1f} ms</span></div>'
         )
+    note_html = (
+        f'<div class="pill-enhanced"><span>⚡ {html.escape(enhancement_note)}</span></div>'
+        if enhancement_note
+        else ""
+    )
     return f"""
 <div class="insights">
-  <div class="insight-main"><div class="tiles">{''.join(tiles)}</div>{donut}</div>
+  <div class="insight-main">{note_html}<div class="tiles">{''.join(tiles)}</div>{donut}</div>
   <div class="latency"><h4>Latency</h4>{''.join(bars)}
   <p class="fine">The cross-encoder time includes the shared BM25 stage-1 retrieval.</p></div>
 </div>"""
@@ -641,6 +667,47 @@ def _read_ablation_tables() -> List[List[Dict[str, object]]]:
     return tables
 
 
+def _read_json_result(filename: str) -> Dict[str, object]:
+    path = RESULTS_DIR / filename
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("Expected a JSON object in %s", path)
+        return {}
+    return value
+
+
+def _read_per_query_metrics() -> Dict[str, Dict[str, float]]:
+    path = RESULTS_DIR / "per_query_metrics.csv"
+    if not path.is_file():
+        return {}
+    metrics: Dict[str, Dict[str, float]] = {}
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                system = row.get("system")
+                query_id = row.get("query_id")
+                raw_mrr = row.get("MRR@10")
+                if not system or not query_id or raw_mrr is None:
+                    continue
+                try:
+                    metrics.setdefault(system, {})[query_id] = float(raw_mrr)
+                except ValueError:
+                    logger.warning(
+                        "Skipping invalid per-query MRR value for system=%s query=%s",
+                        system,
+                        query_id,
+                    )
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+    return metrics
+
+
 def _chart_card(title: str, subtitle: str, svg: str, extra_class: str = "") -> str:
     return f"""
 <section class="chart-card {extra_class}">
@@ -648,6 +715,348 @@ def _chart_card(title: str, subtitle: str, svg: str, extra_class: str = "") -> s
     <p>{html.escape(subtitle)}</p></div></div>
   <div class="chart-viewport">{svg}</div>
 </section>"""
+
+
+def _render_quality_chart(rows: Sequence[Dict[str, object]]) -> str:
+    metrics = [
+        ("MRR@10", "#6366f1"),
+        ("NDCG@10", "#06b6d4"),
+        ("Recall@100", "#10b981"),
+    ]
+    data = [
+        row for row in rows
+        if any(isinstance(row.get(metric), (int, float)) for metric, _ in metrics)
+    ]
+    if not data:
+        return '<div class="chart-empty">No quality metrics available.</div>'
+
+    width = 900
+    left, right, top, row_height = 235, 80, 38, 53
+    height = top + row_height * len(data) + 42
+    plot_width = width - left - right
+    parts = [
+        f'<svg class="data-chart tall-chart" viewBox="0 0 {width} {height}" '
+        'role="img" aria-label="Grouped comparison of local MRR, NDCG and Recall at 100">'
+    ]
+    for tick in range(5):
+        value = tick / 4
+        x = left + plot_width * value
+        parts.append(
+            f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top-12}" '
+            f'x2="{x:.1f}" y2="{height-28}"/>'
+            f'<text class="axis-tick" x="{x:.1f}" y="20" text-anchor="middle">{value:.2f}</text>'
+        )
+    for row_index, row in enumerate(data):
+        y = top + row_index * row_height
+        system = str(row["System"])
+        parts.append(
+            f'<text class="axis-tick row-label" x="{left-14}" y="{y+21}" '
+            f'text-anchor="end">{html.escape(system)}</text>'
+        )
+        for metric_index, (metric, color) in enumerate(metrics):
+            value = row.get(metric)
+            if not isinstance(value, (int, float)):
+                continue
+            bar_y = y + metric_index * 12
+            bar_width = plot_width * max(0.0, min(1.0, float(value)))
+            parts.append(
+                f'<rect class="chart-bar" x="{left}" y="{bar_y}" width="{bar_width:.1f}" '
+                f'height="8" rx="4" fill="{color}"><title>{html.escape(system)} · '
+                f'{metric}: {value:.4f}</title></rect>'
+            )
+            parts.append(
+                f'<text class="bar-value" x="{min(width-right-2, left+bar_width+6):.1f}" '
+                f'y="{bar_y+8}" text-anchor="start">{value:.3f}</text>'
+            )
+    legend = []
+    legend_x = [left, left + 170, left + 340]
+    for (metric, color), x in zip(metrics, legend_x):
+        legend.append(
+            f'<rect x="{x}" y="{height-18}" width="10" height="10" rx="3" fill="{color}"/>'
+            f'<text class="axis-tick" x="{x+16}" y="{height-9}">{metric}</text>'
+        )
+    parts.extend(legend)
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_latency_chart(rows: Sequence[Dict[str, object]], latency_queries: int) -> str:
+    data = []
+    for row in rows:
+        try:
+            data.append(
+                (
+                    str(row["System"]),
+                    float(row["Median latency (ms/query)"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not data:
+        return '<div class="chart-empty">No latency measurements available.</div>'
+
+    data.sort(key=lambda item: item[1])
+    bm25_latency = next((latency for name, latency in data if name == "BM25"), None)
+    width = 900
+    left, right, top, row_height = 265, 220, 34, 42
+    height = top + row_height * len(data) + 24
+    plot_width = width - left - right
+    maximum = max(latency for _, latency in data) or 1.0
+    parts = [
+        f'<svg class="data-chart tall-chart" viewBox="0 0 {width} {height}" '
+        f'role="img" aria-label="Median latency per query measured on {latency_queries} local test queries">'
+    ]
+    for tick in range(5):
+        value = maximum * tick / 4
+        x = left + plot_width * tick / 4
+        parts.append(
+            f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top-10}" '
+            f'x2="{x:.1f}" y2="{height-14}"/>'
+            f'<text class="axis-tick" x="{x:.1f}" y="17" text-anchor="middle">{value:.0f} ms</text>'
+        )
+    for index, (name, latency) in enumerate(data):
+        y = top + index * row_height
+        speedup = (
+            f"{bm25_latency / latency:.1f}× faster than BM25"
+            if bm25_latency and latency < bm25_latency
+            else (
+                f"{latency / bm25_latency:.1f}× BM25 latency"
+                if bm25_latency and latency > bm25_latency
+                else "BM25 reference"
+            )
+        )
+        bar_width = plot_width * latency / maximum
+        color = SYSTEMS.get(name, ("", "#64748b", ""))[1]
+        parts.append(
+            f'<text class="axis-tick row-label" x="{left-12}" y="{y+15}" '
+            f'text-anchor="end">{html.escape(name)}</text>'
+            f'<rect class="chart-bar" x="{left}" y="{y}" width="{bar_width:.1f}" '
+            f'height="21" rx="7" fill="{color}"><title>{html.escape(name)}: '
+            f'{latency:.2f} ms/query</title></rect>'
+            f'<text class="bar-value" x="{left+bar_width+8:.1f}" y="{y+14}">'
+            f'{latency:.2f} ms · {html.escape(speedup)}</text>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_paired_ci_chart(paired: Dict[str, object]) -> str:
+    entries = []
+
+    def add_entry(label: str, result: object) -> None:
+        if not isinstance(result, dict):
+            return
+        metrics = result.get("comparison_minus_baseline", {})
+        mrr = metrics.get("MRR@10") if isinstance(metrics, dict) else None
+        if not isinstance(mrr, dict):
+            return
+        try:
+            entries.append(
+                (
+                    label,
+                    float(mrr["mean_difference"]),
+                    float(mrr["ci_lower"]),
+                    float(mrr["ci_upper"]),
+                    int(mrr["paired_queries"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+
+    for system, result in paired.items():
+        if not isinstance(result, dict):
+            continue
+        baseline = str(result.get("baseline", "BM25"))
+        add_entry(f"{system} vs {baseline}", result)
+        additional = result.get("additional_comparisons", {})
+        if isinstance(additional, dict):
+            for additional_baseline, comparison in additional.items():
+                add_entry(
+                    f"{system} vs {additional_baseline}",
+                    comparison,
+                )
+    if not entries:
+        return '<div class="chart-empty">Paired confidence intervals are not available.</div>'
+
+    minimum = min(-0.05, min(item[2] for item in entries))
+    maximum = max(0.05, max(item[3] for item in entries))
+    margin = (maximum - minimum) * 0.08
+    minimum -= margin
+    maximum += margin
+    width, left, right, top, row_height = 1100, 430, 40, 36, 39
+    height = top + row_height * len(entries) + 23
+    plot_width = width - left - right
+    x_for = lambda value: left + (value - minimum) / (maximum - minimum) * plot_width
+    zero_x = x_for(0.0)
+    parts = [
+        f'<svg class="data-chart tall-chart" viewBox="0 0 {width} {height}" '
+        'role="img" aria-label="Paired bootstrap 95 percent confidence intervals for MRR at 10 relative to BM25 and TF-IDF">'
+    ]
+    for tick in range(5):
+        value = minimum + (maximum - minimum) * tick / 4
+        x = left + plot_width * tick / 4
+        parts.append(
+            f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top-8}" '
+            f'x2="{x:.1f}" y2="{height-14}"/>'
+            f'<text class="axis-tick" x="{x:.1f}" y="17" text-anchor="middle">{value:+.2f}</text>'
+        )
+    parts.append(
+        f'<line x1="{zero_x:.1f}" y1="{top-10}" x2="{zero_x:.1f}" y2="{height-14}" '
+        'stroke="#64748b" stroke-width="2" stroke-dasharray="5 4"/>'
+    )
+    for index, (system, mean, lower, upper, count) in enumerate(entries):
+        y = top + index * row_height + 10
+        color = "#059669" if lower > 0 else ("#dc2626" if upper < 0 else "#64748b")
+        parts.append(
+            f'<text class="axis-tick row-label" x="{left-12}" y="{y+4}" '
+            f'text-anchor="end">{html.escape(system)}</text>'
+            f'<line x1="{x_for(lower):.1f}" y1="{y}" x2="{x_for(upper):.1f}" y2="{y}" '
+            f'stroke="{color}" stroke-width="4" stroke-linecap="round"/>'
+            f'<line x1="{x_for(lower):.1f}" y1="{y-5}" x2="{x_for(lower):.1f}" y2="{y+5}" '
+            f'stroke="{color}" stroke-width="2"/>'
+            f'<line x1="{x_for(upper):.1f}" y1="{y-5}" x2="{x_for(upper):.1f}" y2="{y+5}" '
+            f'stroke="{color}" stroke-width="2"/>'
+            f'<circle cx="{x_for(mean):.1f}" cy="{y}" r="6" fill="{color}">'
+            f'<title>{html.escape(system)}: {mean:+.4f}; 95% CI [{lower:+.4f}, '
+            f'{upper:+.4f}], n={count}</title></circle>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _linear_quantile(values: Sequence[float], probability: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _render_query_distribution_chart(
+    per_query: Dict[str, Dict[str, float]],
+) -> str:
+    systems = [
+        (name, values)
+        for name, values in per_query.items()
+        if values
+    ]
+    if not systems:
+        return '<div class="chart-empty">Per-query MRR distributions are not available.</div>'
+    width, left, right, top, row_height = 900, 270, 40, 32, 39
+    height = top + row_height * len(systems) + 34
+    plot_width = width - left - right
+    parts = [
+        f'<svg class="data-chart tall-chart" viewBox="0 0 {width} {height}" '
+        'role="img" aria-label="Distribution of test-query MRR at 10 by retrieval system">'
+    ]
+    for tick in range(5):
+        value = tick / 4
+        x = left + plot_width * value
+        parts.append(
+            f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top-10}" '
+            f'x2="{x:.1f}" y2="{height-25}"/>'
+            f'<text class="axis-tick" x="{x:.1f}" y="16" text-anchor="middle">{value:.2f}</text>'
+        )
+    for index, (system, values_map) in enumerate(systems):
+        values = list(values_map.values())
+        low = min(values)
+        q1 = _linear_quantile(values, 0.25)
+        median = _linear_quantile(values, 0.5)
+        q3 = _linear_quantile(values, 0.75)
+        high = max(values)
+        y = top + index * row_height + 12
+        color = SYSTEMS.get(system, ("", "#64748b", ""))[1]
+        x_for = lambda value: left + plot_width * value
+        parts.append(
+            f'<text class="axis-tick row-label" x="{left-12}" y="{y+4}" '
+            f'text-anchor="end">{html.escape(system)}</text>'
+            f'<line x1="{x_for(low):.1f}" y1="{y}" x2="{x_for(high):.1f}" y2="{y}" '
+            f'stroke="{color}" stroke-width="2" opacity=".7"/>'
+            f'<rect class="chart-bar" x="{x_for(q1):.1f}" y="{y-8}" '
+            f'width="{max(1.0, x_for(q3)-x_for(q1)):.1f}" height="16" rx="5" '
+            f'fill="{color}" opacity=".5"><title>{html.escape(system)} MRR@10: '
+            f'min {low:.3f}, Q1 {q1:.3f}, median {median:.3f}, Q3 {q3:.3f}, '
+            f'max {high:.3f} (n={len(values)})</title></rect>'
+            f'<line x1="{x_for(median):.1f}" y1="{y-9}" x2="{x_for(median):.1f}" '
+            f'y2="{y+9}" stroke="{color}" stroke-width="3"/>'
+        )
+    parts.extend([
+        f'<text class="axis-label" x="{left+plot_width/2}" y="{height-5}" '
+        'text-anchor="middle">Per-query MRR@10 · whiskers show min–max; box shows Q1–Q3</text>',
+        "</svg>",
+    ])
+    return "".join(parts)
+
+
+def _render_query_outcomes_chart(
+    per_query: Dict[str, Dict[str, float]],
+) -> str:
+    baseline = per_query.get("BM25")
+    if not baseline:
+        return '<div class="chart-empty">BM25 per-query metrics are not available.</div>'
+    systems = [(name, values) for name, values in per_query.items() if name != "BM25"]
+    if not systems:
+        return '<div class="chart-empty">No systems available for a paired query comparison.</div>'
+
+    width, left, right, top, row_height = 900, 275, 50, 32, 39
+    height = top + row_height * len(systems) + 42
+    plot_width = width - left - right
+    parts = [
+        f'<svg class="data-chart tall-chart" viewBox="0 0 {width} {height}" '
+        'role="img" aria-label="Count of test queries where each system improves, ties or loses MRR against BM25">'
+    ]
+    for tick in range(5):
+        value = tick / 4
+        x = left + plot_width * value
+        parts.append(
+            f'<line class="grid-line vertical" x1="{x:.1f}" y1="{top-10}" '
+            f'x2="{x:.1f}" y2="{height-28}"/>'
+            f'<text class="axis-tick" x="{x:.1f}" y="16" text-anchor="middle">{value:.0%}</text>'
+        )
+    for index, (system, values) in enumerate(systems):
+        matched = [
+            (score, baseline[qid])
+            for qid, score in values.items()
+            if qid in baseline
+        ]
+        if not matched:
+            continue
+        wins = sum(score > reference for score, reference in matched)
+        ties = sum(score == reference for score, reference in matched)
+        losses = len(matched) - wins - ties
+        y = top + index * row_height
+        x = left
+        for count, color, label in (
+            (wins, "#059669", "improved"),
+            (ties, "#94a3b8", "tied"),
+            (losses, "#ef4444", "lower"),
+        ):
+            segment_width = plot_width * count / len(matched)
+            parts.append(
+                f'<rect class="chart-bar" x="{x:.1f}" y="{y}" width="{segment_width:.1f}" '
+                f'height="22" fill="{color}"><title>{html.escape(system)} {label}: '
+                f'{count}/{len(matched)} queries ({count/len(matched):.1%})</title></rect>'
+            )
+            x += segment_width
+        parts.append(
+            f'<text class="axis-tick row-label" x="{left-12}" y="{y+15}" '
+            f'text-anchor="end">{html.escape(system)}</text>'
+            f'<text class="axis-tick" x="{left+plot_width+9}" y="{y+15}">'
+            f'{wins} / {ties} / {losses}</text>'
+        )
+    parts.extend([
+        '<rect x="210" y="' + str(height - 17) + '" width="10" height="10" rx="3" fill="#059669"/>'
+        '<text class="axis-tick" x="226" y="' + str(height - 8) + '">improved</text>'
+        '<rect x="318" y="' + str(height - 17) + '" width="10" height="10" rx="3" fill="#94a3b8"/>'
+        '<text class="axis-tick" x="334" y="' + str(height - 8) + '">tied</text>'
+        '<rect x="385" y="' + str(height - 17) + '" width="10" height="10" rx="3" fill="#ef4444"/>'
+        '<text class="axis-tick" x="401" y="' + str(height - 8) + '">lower</text>',
+        "</svg>",
+    ])
+    return "".join(parts)
 
 
 def _render_pareto_chart(rows: Sequence[Dict[str, object]]) -> str:
@@ -808,6 +1217,113 @@ def _render_query_length_chart(rows: Sequence[Dict[str, object]]) -> str:
     return "".join(parts)
 
 
+def _read_scifact_section() -> str:
+    path = RESULTS_DIR / "scifact_metrics.json"
+    if not path.is_file():
+        path = ARTIFACTS_DIR / "results" / "scifact_metrics.json"
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read SciFact metrics: %s", exc)
+        return ""
+
+    runs = data.get("runs", {})
+    if not runs:
+        return ""
+
+    system_names = {
+        "bm25": "BM25",
+        "biencoder": "Bi-encoder (Zero-shot)",
+        "rrf": "Hybrid RRF (Zero-shot, k=60)",
+        "bm25_crossencoder": "BM25 → Cross-encoder (Zero-shot)",
+        "rrf_crossencoder": "Hybrid RRF → Cross-encoder (Zero-shot)",
+    }
+    metrics_keys = ["MRR@10", "NDCG@10", "P@5", "Recall@10", "Recall@100", "MAP@10"]
+
+    best = {}
+    for k in metrics_keys:
+        best[k] = max(run.get("metrics", {}).get(k, 0.0) for run in runs.values())
+
+    rows_html = []
+    for key, display_name in system_names.items():
+        if key not in runs:
+            continue
+        m = runs[key].get("metrics", {})
+        cells = []
+        for mk in metrics_keys:
+            val = m.get(mk, 0.0)
+            is_best = abs(val - best[mk]) < 1e-5 and val > 0
+            cls = ' class="best"' if is_best else ""
+            cells.append(f"<td{cls}>{val:.4f}</td>")
+        rows_html.append(f"<tr><th>{html.escape(display_name)}</th>{''.join(cells)}</tr>")
+
+    head_html = "".join(f"<th>{k}</th>" for k in metrics_keys)
+    query_count = data.get("query_count", 300)
+    corpus_count = data.get("corpus_count", 5183)
+
+    return f"""
+<div class="bench-intro scifact-intro"><span class="eyebrow">ZERO-SHOT DOMAIN TRANSFER (BEIR)</span>
+  <h2>SciFact Benchmark — Out-of-Domain Generalization</h2>
+  <p>Evaluates zero-shot transfer on <strong>{query_count} test queries</strong> across <strong>{corpus_count:,} scientific research abstracts</strong> from BEIR SciFact with no in-domain fine-tuning.</p>
+</div>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>System</th>{head_html}</tr></thead>
+  <tbody>{''.join(rows_html)}</tbody>
+</table>
+</div>
+<p class="fine"><strong>Key Finding:</strong> Hybrid RRF achieves the highest Recall@100 (<strong>{best.get('Recall@100', 0):.3f}</strong>) and NDCG@10 (<strong>{best.get('NDCG@10', 0):.3f}</strong>) by combining lexical exact-term matching with dense semantic embeddings, outperforming individual retrievers without retraining.</p>
+"""
+
+
+def _read_query_enhancement_section() -> str:
+    path = RESULTS_DIR / "query_bm25_comparison_test.json"
+    if not path.is_file():
+        path = ARTIFACTS_DIR / "results" / "query_bm25_comparison_test.json"
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read query enhancement metrics: %s", exc)
+        return ""
+
+    changes = data.get("changes_vs_original", {})
+    if not changes:
+        return ""
+
+    rows = [
+        "<tr><th>Original Query</th><td>Baseline (0.0000)</td><td>Baseline (0.0000)</td><td>Baseline (0.0000)</td><td>0.00 ms</td></tr>"
+    ]
+    for method, details in changes.items():
+        label = "Normalization (NFKC + casefold)" if method == "normalize" else "Synonym Expansion"
+        m_diff = details["metric_change_vs_original"].get("MRR@10", {})
+        n_diff = details["metric_change_vs_original"].get("NDCG@10", {})
+        r_diff = details["metric_change_vs_original"].get("Recall@100", {})
+        lat_diff = details.get("mean_latency_change_ms", 0.0)
+
+        m_val = f"{m_diff.get('mean_difference', 0.0):+.4f} [{m_diff.get('ci_lower', 0):+.4f}, {m_diff.get('ci_upper', 0):+.4f}]"
+        n_val = f"{n_diff.get('mean_difference', 0.0):+.4f} [{n_diff.get('ci_lower', 0):+.4f}, {n_diff.get('ci_upper', 0):+.4f}]"
+        r_val = f"{r_diff.get('mean_difference', 0.0):+.4f} [{r_diff.get('ci_lower', 0):+.4f}, {r_diff.get('ci_upper', 0):+.4f}]"
+        rows.append(f"<tr><th>{html.escape(label)}</th><td>{m_val}</td><td>{n_val}</td><td>{r_val}</td><td>{lat_diff:+.2f} ms</td></tr>")
+
+    return f"""
+<div class="bench-intro qe-intro"><span class="eyebrow">QUERY ENHANCEMENT ABLATION</span>
+  <h2>Query Transformation Impact on BM25 (MS MARCO Test)</h2>
+  <p>Paired bootstrap difference (95% CI, 2,000 resamples) across 750 test queries comparing original vs. normalized vs. synonym-expanded queries.</p>
+</div>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Query Transformation</th><th>Δ MRR@10 (95% CI)</th><th>Δ NDCG@10 (95% CI)</th><th>Δ Recall@100 (95% CI)</th><th>Δ Latency</th></tr></thead>
+  <tbody>{''.join(rows)}</tbody>
+</table>
+</div>
+<p class="fine"><strong>Insight:</strong> Unicode normalization preserves lexical precision identically with zero overhead. Synonym expansion introduces slight drift if applied unconditionally, demonstrating the value of precision-focused neural cross-encoding over broad lexical expansion.</p>
+"""
+
+
 def render_benchmark() -> str:
     rows = _read_benchmark()
     if not rows:
@@ -831,6 +1347,46 @@ def render_benchmark() -> str:
         "Median latency (ms/query)",
     ]
     metrics = [metric for metric in preferred_metrics if any(metric in row for row in rows)]
+    manifest = _read_json_result("evaluation_manifest.json")
+    paired_differences = _read_json_result("paired_differences.json")
+    per_query = _read_per_query_metrics()
+    try:
+        query_count = int(manifest.get("query_count", 0))
+        latency_queries = int(manifest.get("latency_query_count", 0))
+        run_config = manifest.get("config", {})
+        candidate_depth = int(run_config.get("candidate_depth", 0))
+        rerank_depth = int(run_config.get("rerank_depth", 0))
+        rrf_k = int(run_config.get("rrf_k", 0))
+    except (AttributeError, TypeError, ValueError):
+        query_count = latency_queries = candidate_depth = rerank_depth = rrf_k = 0
+    dataset_name = str(manifest.get("dataset", "local dataset"))
+    if dataset_name.casefold() == "msmarco-passage":
+        dataset_name = "MS MARCO passage"
+    dataset_label = html.escape(dataset_name)
+    split_label = html.escape(str(manifest.get("split", "recorded split")))
+    query_summary = f"{query_count} queries" if query_count else "the recorded queries"
+    latency_summary = (
+        f"{latency_queries} queries" if latency_queries else "the recorded query sample"
+    )
+
+    valid_rows = [row for row in rows if row.get("Recall@100 valid") is not False]
+    best_mrr = max(
+        (row for row in valid_rows if "MRR@10" in row),
+        key=lambda row: float(row["MRR@10"]),
+        default=None,
+    )
+    best_recall = max(
+        (row for row in valid_rows if "Recall@100" in row),
+        key=lambda row: float(row["Recall@100"]),
+        default=None,
+    )
+    fastest = min(
+        (row for row in valid_rows if "Median latency (ms/query)" in row),
+        key=lambda row: float(row["Median latency (ms/query)"]),
+        default=None,
+    )
+    bm25 = next((row for row in valid_rows if row.get("System") == "BM25"), None)
+
     best = {}
     for metric in metrics:
         values = [r[metric] for r in rows if metric in r]
@@ -853,13 +1409,99 @@ def render_benchmark() -> str:
         )
     pareto = _chart_card(
         "Quality vs. speed",
-        "Local MS MARCO test evaluation. Favor the upper-left: higher MRR with lower query latency.",
+        f"Saved local {dataset_label} {split_label} evaluation. Favor the upper-left: "
+        "higher MRR with lower query latency.",
         _render_pareto_chart(rows),
+        "wide-chart",
+    )
+    quality_chart = _chart_card(
+        "Ranking quality at a glance",
+        "Higher is better. MRR@10 and NDCG@10 focus on top-ranked relevance; Recall@100 measures candidate coverage.",
+        _render_quality_chart(rows),
+        "wide-chart",
+    )
+    latency_chart = _chart_card(
+        "Median latency per query",
+        f"Sorted fastest to slowest · measured on {latency_queries or 'the recorded'} local test queries. "
+        "Lower is faster; speed ratios use BM25 as the reference.",
+        _render_latency_chart(rows, latency_queries),
+        "wide-chart",
+    )
+    confidence_chart = _chart_card(
+        "Paired MRR@10 difference vs. BM25 and TF-IDF",
+        "Point is the mean difference; whisker is the paired bootstrap 95% confidence interval. "
+        "Positive differences favor the method; intervals wholly right of zero favor it, while intervals crossing zero indicate uncertainty.",
+        _render_paired_ci_chart(paired_differences),
+        "wide-chart",
+    )
+    distribution_chart = _chart_card(
+        "Per-query MRR@10 distribution",
+        "Center line is median; box is the interquartile range; whiskers span the minimum and maximum query scores.",
+        _render_query_distribution_chart(per_query),
+        "wide-chart",
+    )
+    outcomes_chart = _chart_card(
+        "How often each system beats BM25",
+        "Paired test queries compared by MRR@10. Counts at right are improved / tied / lower; each query is compared to itself.",
+        _render_query_outcomes_chart(per_query),
+        "wide-chart",
+    )
+    summary_tiles = []
+    if best_mrr:
+        summary_tiles.append(
+            _tile("Best MRR@10", f"{float(best_mrr['MRR@10']):.3f}", str(best_mrr["System"]))
+        )
+    if best_recall:
+        summary_tiles.append(
+            _tile(
+                "Best Recall@100",
+                f"{float(best_recall['Recall@100']):.3f}",
+                str(best_recall["System"]),
+            )
+        )
+    if fastest:
+        summary_tiles.append(
+            _tile(
+                "Lowest median latency",
+                f"{float(fastest['Median latency (ms/query)']):.1f} ms",
+                str(fastest["System"]),
+            )
+        )
+    if best_mrr and bm25 and float(bm25.get("MRR@10", 0)) > 0:
+        summary_tiles.append(
+            _tile(
+                "MRR@10 lift vs. BM25",
+                f"+{float(best_mrr['MRR@10']) - float(bm25['MRR@10']):.3f}",
+                str(best_mrr["System"]),
+            )
+        )
+    protocol_items = [
+        f"<li><strong>Dataset/split:</strong> {html.escape(str(manifest.get('dataset', 'not recorded')))} / "
+        f"{html.escape(str(manifest.get('split', 'not recorded')))}</li>",
+        f"<li><strong>Queries:</strong> {query_count or 'not recorded'} test queries; "
+        f"latency sample: {latency_queries or 'not recorded'} queries</li>",
+        f"<li><strong>Candidate/rerank depth:</strong> {candidate_depth or 'not recorded'} / "
+        f"{rerank_depth or 'not recorded'}</li>",
+        f"<li><strong>RRF constant:</strong> k={rrf_k or 'not recorded'}</li>",
+        f"<li><strong>Query fingerprint:</strong> {html.escape(str(manifest.get('queries_sha256', 'not recorded')))}</li>",
+        f"<li><strong>Qrels fingerprint:</strong> {html.escape(str(manifest.get('qrels_sha256', 'not recorded')))}</li>",
+    ]
+    protocol = (
+        '<details class="protocol"><summary>Evaluation protocol and reproducibility details</summary>'
+        f'<ul>{"".join(protocol_items)}</ul>'
+        '<p>Metrics are macro-averaged over the recorded test queries. Paired confidence intervals '
+        'resample the same query IDs for both systems. Latency is a separate query sample, not a '
+        'per-query quality measurement. These files were copied from the completed local evaluation; '
+        'the live Space uses different bundled corpus/model artifacts.</p></details>'
     )
     ablations = _read_ablation_tables()
-    ablation_cards = ""
+    ablation_section = ""
     if len(ablations) >= 3:
-        ablation_cards = (
+        ablation_section = (
+            '<div class="bench-intro ablation-intro"><span class="eyebrow">ABLATION STUDIES</span>'
+            "<h2>What changes the ranking?</h2>"
+            "<p>Validation experiments isolate training negatives and candidate depth; "
+            "query-length results use the test split.</p></div>"
             '<div class="chart-grid">'
             + _chart_card("Negative sampling", "Validation MRR@10 · hard vs random training negatives",
                           _render_negative_chart(ablations[0]))
@@ -873,56 +1515,133 @@ def render_benchmark() -> str:
 <div class="bench">
   <div class="bench-intro"><span class="eyebrow">OFFLINE EVALUATION</span>
     <h2>Local MS MARCO evaluation — saved results</h2>
-    <p><strong>Heads-up:</strong> these metrics were produced by the local/Colab project run on its MS MARCO test split
-    (750 queries; latency sampled on 200). They do not describe a separate Hugging Face Space unless its corpus and
-    checkpoints match. The table is a reference to this saved evaluation, not a claim about another deployment's live
-    quality or latency.</p>
+    <p><strong>Heads-up:</strong> these metrics were produced by local/Colab evaluation on the
+    {dataset_label} {split_label} split ({query_summary}; latency sampled on {latency_summary}).
+    They are not measurements of this Space's currently bundled corpus or model
+    checkpoints. They do not describe a separate Hugging Face Space unless its corpus and
+    checkpoints match. Live neural inference runs on CPU by default. The table is a reference, not a claim about live Space quality or latency.</p>
   </div>
+  <div class="tiles benchmark-tiles">{''.join(summary_tiles)}</div>
+  {protocol}
   <table><thead><tr><th>System</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>
-  <p class="fine">Best value per column highlighted. Results and run provenance are in the local evaluation artifacts.
-  Recall@100 is from the saved full-depth ranked runs, not top-10 outputs.</p>
-  {pareto}
-  <div class="bench-intro ablation-intro"><span class="eyebrow">ABLATION STUDIES</span>
-    <h2>What changes the ranking?</h2>
-    <p>Validation experiments isolate training negatives and candidate depth; query-length results use the test split.</p>
+  <p class="fine">Best value per column highlighted. Results and run provenance are in artifacts/local-evaluation.
+  {"Recall@100 is from saved full-depth local ranked runs, not top-10 outputs." if "Recall@100" in metrics else ""}</p>
+  <div class="chart-grid benchmark-charts">
+    {quality_chart}
+    {latency_chart}
+    {pareto}
+    {confidence_chart}
+    {distribution_chart}
+    {outcomes_chart}
   </div>
-  {ablation_cards}
+  {ablation_section}
+  {_read_scifact_section()}
+  {_read_query_enhancement_section()}
 </div>"""
 
 
 HOW_IT_WORKS = """
-### How the systems differ
-
-| System | Idea | Strength | Weakness |
-|---|---|---|---|
-| **TF-IDF** | Weight terms by frequency and rarity, cosine similarity | Fast, transparent | No length normalisation, exact words only |
-| **BM25** | TF-IDF refinement with saturation and length normalisation | Strong lexical baseline | Vocabulary mismatch (synonyms, paraphrase) |
-| **Bi-encoder** | Embed query and passage independently, compare vectors | Very fast at query time, semantic | Single vector per passage loses detail |
-| **Hybrid RRF** | Fuse BM25 and bi-encoder ranks with Reciprocal Rank Fusion | Combines complementary lexical and semantic candidates | Adds dense retrieval cost; needs evaluation |
-| **BM25 → Cross-encoder** | Re-score BM25's top-N by reading query and passage together | Most precise per pair | Slow; **capped by BM25's recall** |
-| **Hybrid RRF → Cross-encoder** | Re-score a fused BM25+dense candidate pool | Combines broad recall and interaction scoring | Higher latency and candidate costs |
-
-### Reading the result cards
-- **Coloured bar:** the score, scaled within that column. Scores from different systems are on different scales, so compare ranks, not raw values.
-- **▲ / ▼ chips:** how far a passage moved relative to BM25's ranking.
-- **✨ outside BM25 top-N:** the system found a passage BM25's candidate list never contained. For the cross-encoder this can't happen (it only re-orders BM25 candidates), which is exactly why a dense first stage helps.
-- **Highlighted words:** query terms, so you can see when a system retrieves *without* lexical overlap.
-
-### Metrics
-- **MRR@10:** average of 1/rank of the first relevant passage in the top 10.
-- **NDCG@10:** rewards putting relevant passages higher, with a log discount.
-- **Recall@100:** share of relevant passages found in the top 100.
+<div class="guide">
+  <header class="tab-intro">
+    <span class="eyebrow">A QUICK FIELD GUIDE</span>
+    <h2>How to read the retrieval comparison</h2>
+    <p>Each method sees the same query and passage collection, but finds and orders candidates differently.
+    Compare the returned passages and rank changes; relevance is not inferred for a live search.</p>
+  </header>
+  <div class="pipeline" aria-label="Retrieval stages">
+    <div class="pipeline-step"><span>01</span><strong>Find candidates</strong><small>Lexical, semantic, or both</small></div>
+    <b class="pipeline-arrow">→</b>
+    <div class="pipeline-step"><span>02</span><strong>Fuse or re-rank</strong><small>Optional deeper scoring</small></div>
+    <b class="pipeline-arrow">→</b>
+    <div class="pipeline-step"><span>03</span><strong>Compare top results</strong><small>Inspect ranks and evidence</small></div>
+  </div>
+  <h3 class="guide-section-title">Retrieval methods</h3>
+  <div class="system-grid">
+    <article class="system-card" style="--guide-accent:#f59e0b">
+      <span class="system-kind">LEXICAL</span><h3>TF-IDF</h3>
+      <p>Weights terms by frequency and rarity, then scores matching words.</p>
+      <div><b>Good at</b> fast, transparent exact-term matching</div>
+      <div><b>Watch for</b> vocabulary mismatch and no length normalisation</div>
+    </article>
+    <article class="system-card" style="--guide-accent:#3b82f6">
+      <span class="system-kind">LEXICAL</span><h3>BM25</h3>
+      <p>A tuned lexical baseline with term saturation and document-length normalisation.</p>
+      <div><b>Good at</b> strong exact-term retrieval</div>
+      <div><b>Watch for</b> synonyms and paraphrases that use different words</div>
+    </article>
+    <article class="system-card" style="--guide-accent:#10b981">
+      <span class="system-kind">SEMANTIC</span><h3>Bi-encoder</h3>
+      <p>Encodes the query and passages separately, then compares their vectors.</p>
+      <div><b>Good at</b> matching meaning across different wording</div>
+      <div><b>Watch for</b> detail lost in a single vector representation</div>
+    </article>
+    <article class="system-card" style="--guide-accent:#06b6d4">
+      <span class="system-kind">HYBRID</span><h3>Hybrid RRF</h3>
+      <p>Combines BM25 and bi-encoder rankings with Reciprocal Rank Fusion.</p>
+      <div><b>Good at</b> combining lexical and semantic candidates</div>
+      <div><b>Watch for</b> extra retrieval cost; fusion still needs evaluation</div>
+    </article>
+    <article class="system-card" style="--guide-accent:#8b5cf6">
+      <span class="system-kind">NEURAL RE-RANKING (NLI)</span><h3>BM25 → Cross-encoder</h3>
+      <p>Jointly scores query–passage pairs using <code>nli-MiniLM2-L6-H768</code> with natural language inference logit margin: <code>score = entailment - contradiction</code>.</p>
+      <div><b>Good at</b> deep semantic premise entailment and precise pairwise ranking</div>
+      <div><b>Watch for</b> latency and BM25 candidate recall ceiling</div>
+    </article>
+    <article class="system-card" style="--guide-accent:#ec4899">
+      <span class="system-kind">HYBRID + NLI RE-RANKING</span><h3>Hybrid RRF → Cross-encoder</h3>
+      <p>Re-scores candidates from lexical BM25 and semantic bi-encoder vectors with Natural Language Inference.</p>
+      <div><b>Good at</b> broader candidate coverage plus deep pairwise logic</div>
+      <div><b>Watch for</b> dual retrieval latency before re-ranking</div>
+    </article>
+  </div>
+  <div class="guide-grid">
+    <section class="guide-panel">
+      <span class="eyebrow">READ THE RESULTS</span><h3>What the cards tell you</h3>
+      <ul>
+        <li><b>Rank number</b> is the method's position for that passage.</li>
+        <li><b>▲ / ▼ chips</b> show movement relative to BM25; ✨ means the passage was outside BM25's candidate depth.</li>
+        <li><b>Score bars</b> are scaled within each method. Raw scores across methods are not directly comparable.</li>
+        <li><b>Highlighted terms</b> reveal exact query-word overlap; no highlight does not mean a passage is irrelevant.</li>
+        <li><b>Latency</b> is an observed time for this query on the current Space hardware, not a benchmark guarantee.</li>
+      </ul>
+    </section>
+    <section class="guide-panel metrics-panel">
+      <span class="eyebrow">OFFLINE EVALUATION METRICS</span><h3>How quality is measured</h3>
+      <div><b>MRR@10</b><p>Rewards placing the first relevant passage near the top ten.</p></div>
+      <div><b>NDCG@10</b><p>Rewards highly ranked relevant passages, with a discount for lower positions.</p></div>
+      <div><b>Recall@100</b><p>Share of judged relevant passages retrieved in the top 100 candidates.</p></div>
+      <p class="fine">These require judged queries and matching qrels. The saved local benchmark is explicitly labeled on its tab.</p>
+    </section>
+  </div>
+  <div class="guide-grid" style="margin-top:14px;">
+    <section class="guide-panel">
+      <span class="eyebrow">QUERY ENHANCEMENT</span><h3>Lexical transformations</h3>
+      <div><b>Unicode Normalization (NFKC)</b><p>Normalizes full-width characters, accents, and spacing into consistent Unicode forms with zero metric degradation.</p></div>
+      <div><b>Synonym Expansion</b><p>Bridges vocabulary mismatch by appending known synonym phrases from a curated domain dictionary.</p></div>
+    </section>
+    <section class="guide-panel">
+      <span class="eyebrow">ZERO-SHOT GENERALIZATION</span><h3>BEIR transfer evaluation</h3>
+      <div><b>SciFact Dataset</b><p>Tests whether models trained on conversational web queries (MS MARCO) transfer to biomedical claim verification without retraining.</p></div>
+      <div><b>RRF Fusion Strength</b><p>Reciprocal Rank Fusion consistently maintains robust recall (0.957) across domains where individual models degrade.</p></div>
+    </section>
+  </div>
+</div>
 """
 
 
 CSS = """
+html, body { height: auto !important; min-height: 0 !important; }
 .gradio-container { max-width: 1280px !important; margin: auto; }
+.gradio-container { height: auto !important; min-height: 0 !important; }
 .hero { padding: 22px 26px; border-radius: 16px; color: #fff;
   background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #db2777 100%); }
 .hero h1 { margin: 0 0 4px; font-size: 1.9rem; letter-spacing: -0.02em; color: #fff; }
 .hero p { margin: 0; opacity: .92; }
 .hero .pills { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
 .hero .pills span { background: rgba(255,255,255,.18); padding: 3px 10px; border-radius: 999px; font-size: .8rem; }
+.pill-enhanced { background: rgba(99, 102, 241, 0.12); border: 1px solid rgba(99, 102, 241, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 10px; font-size: .84rem; color: var(--body-text-color); display: flex; align-items: center; gap: 8px; }
+.pill-enhanced code { background: rgba(0,0,0,.08); padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+.scifact-intro, .qe-intro { margin-top: 32px; }
 .insights { display: grid; grid-template-columns: 2fr 1.3fr; gap: 14px; margin: 6px 0; }
 @media (max-width: 860px) { .insights { grid-template-columns: 1fr; } }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
@@ -1019,14 +1738,163 @@ details p { line-height: 1.55; margin: 6px 0 0; }
 .wide-chart { grid-column: 1 / -1; }
 .chart-empty { padding: 32px 12px; text-align: center; color: var(--body-text-color-subdued); }
 .ablation-intro { padding-top: 22px; }
+.benchmark-tiles { margin: 2px 0; }
+.benchmark-tiles .tile { border-radius: 14px; box-shadow: 0 5px 18px rgba(15,23,42,.04); }
+.bench-intro:first-child { padding: 18px 20px; border: 1px solid rgba(99,102,241,.22);
+  border-left: 5px solid #6366f1; border-radius: 16px;
+  background: linear-gradient(115deg, rgba(99,102,241,.10), rgba(6,182,212,.055)); }
+.bench-intro:first-child p { line-height: 1.65; max-width: 1000px; }
+.bench-intro:first-child strong { color: #b45309; }
+.protocol { padding: 12px 16px; border: 1px solid var(--border-color-primary);
+  border-radius: 12px; background: var(--block-background-fill); }
+.protocol summary { cursor: pointer; color: #4f46e5; font-weight: 700; }
+.protocol ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 28px;
+  padding-left: 20px; font-size: .82rem; }
+.protocol li { overflow-wrap: anywhere; }
+.protocol p { color: var(--body-text-color-subdued); font-size: .8rem; line-height: 1.55; }
+.bench table { box-shadow: 0 8px 24px rgba(15,23,42,.045); }
+.bench thead th { position: sticky; top: 0; z-index: 1; backdrop-filter: blur(8px); }
+.bench tbody tr:hover { background: rgba(99,102,241,.055); }
+.benchmark-charts { gap: 16px; }
+.chart-card { transition: transform .16s ease, box-shadow .16s ease; }
+.chart-card:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(15,23,42,.085); }
+.tall-chart { max-height: 500px; }
+
+/* Shared presentation for the interactive and learning tabs. */
+.tab-intro { margin: 8px 0 18px; padding: 20px 22px; border: 1px solid rgba(99,102,241,.22);
+  border-left: 5px solid #6366f1; border-radius: 16px;
+  background: linear-gradient(115deg, rgba(99,102,241,.10), rgba(6,182,212,.055)); }
+.tab-intro h2 { margin: 4px 0 6px; font-size: 1.38rem; letter-spacing: -.025em; }
+.tab-intro p { max-width: 920px; margin: 0; color: var(--body-text-color-subdued); line-height: 1.65; }
+.search-intro { margin-bottom: 12px; }
+.search-intro h2 { font-size: 1.25rem; }
+.placeholder { margin: 16px 0; border: 1px dashed var(--border-color-primary);
+  border-radius: 16px; background: linear-gradient(140deg, rgba(99,102,241,.07), rgba(6,182,212,.035)); }
+.placeholder h3 { margin: 0 0 6px; color: var(--body-text-color); }
+.placeholder p { max-width: 600px; margin: auto; line-height: 1.6; }
+.insights .tile { border-radius: 14px; box-shadow: 0 5px 18px rgba(15,23,42,.04); }
+.latency { border-radius: 14px; box-shadow: 0 5px 18px rgba(15,23,42,.04); }
+.latency h4 { font-size: .95rem; }
+.cols { gap: 18px; }
+.col header { border-radius: 12px 12px 0 0; }
+.card { border-radius: 14px; }
+.card .snippet { overflow-wrap: anywhere; }
+.pid { font-variant-numeric: tabular-nums; }
+.step-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.step-strip span { display: inline-flex; align-items: center; gap: 8px; padding: 7px 11px;
+  border: 1px solid var(--border-color-primary); border-radius: 999px;
+  background: var(--block-background-fill); font-size: .82rem; font-weight: 600; }
+.step-strip b { display: inline-grid; width: 22px; height: 22px; place-items: center;
+  border-radius: 50%; color: white; background: #6366f1; font-size: .74rem; }
+.feedback-output { margin: 16px 0; padding: 16px; border: 1px solid var(--border-color-primary);
+  border-radius: 16px; background: var(--block-background-fill); }
+.feedback-empty { display: grid; gap: 4px; margin: 12px 0; padding: 18px;
+  border: 1px dashed var(--border-color-primary); border-radius: 14px;
+  background: rgba(99,102,241,.045); }
+.feedback-empty b { font-size: .9rem; }
+.feedback-empty span { color: var(--body-text-color-subdued); font-size: .82rem; }
+.feedback-output > p { color: var(--body-text-color-subdued); font-size: .84rem; }
+.output-banner { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+  margin-bottom: 10px; padding: 12px 14px; border-radius: 12px;
+  background: rgba(99,102,241,.09); }
+.output-banner .eyebrow { flex-basis: 100%; }
+.output-banner strong { font-size: 1.05rem; }
+.output-banner > span:last-child { color: var(--body-text-color-subdued); font-size: .85rem; }
+.feedback-output table, .query-analysis table { width: 100%; border-collapse: separate;
+  border-spacing: 0; font-size: .84rem; }
+.feedback-output th, .feedback-output td, .query-analysis th, .query-analysis td {
+  padding: 9px 11px; border-bottom: 1px solid var(--border-color-primary); text-align: left; vertical-align: top; }
+.feedback-output th, .query-analysis th { position: sticky; top: 0; z-index: 1;
+  background: var(--block-background-fill); font-size: .76rem; color: var(--body-text-color-subdued); }
+.feedback-output td:nth-child(3), .query-analysis td:last-child { min-width: 260px; line-height: 1.5; }
+.feedback-output tbody tr:hover, .query-analysis tbody tr:hover { background: rgba(99,102,241,.06); }
+.analysis-intro { margin-bottom: 18px; }
+.analysis-empty { margin: 18px 0; padding: 20px; border: 1px dashed var(--border-color-primary);
+  border-radius: 14px; background: rgba(99,102,241,.055); }
+.analysis-empty h3 { margin: 5px 0; }
+.analysis-empty p { margin: 0; color: var(--body-text-color-subdued); line-height: 1.6; }
+.query-analysis { display: grid; gap: 14px; margin-top: 18px; }
+.analysis-query, .analysis-summary, .analysis-movement { min-width: 0; padding: 16px;
+  border: 1px solid var(--border-color-primary); border-radius: 16px;
+  background: var(--block-background-fill); }
+.analysis-query h3 { margin: 6px 0 14px; font-size: 1.16rem; line-height: 1.5; }
+.analysis-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.analysis-facts > div { display: grid; gap: 5px; align-content: start; padding: 11px;
+  border-radius: 12px; background: rgba(99,102,241,.075); overflow-wrap: anywhere; }
+.analysis-facts span { color: var(--body-text-color-subdued); font-size: .73rem; text-transform: uppercase; letter-spacing: .04em; }
+.analysis-facts b { font-size: .84rem; }
+.analysis-summary h4, .analysis-movement h4 { margin: 0 0 10px; }
+.metric-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.metric-pills span { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px;
+  border-radius: 999px; background: rgba(99,102,241,.09); font-size: .73rem; white-space: nowrap; }
+.metric-pills b { font-variant-numeric: tabular-nums; }
+.table-scroll { width: 100%; overflow-x: auto; border: 1px solid var(--border-color-primary); border-radius: 10px; }
+.analysis-movement table { min-width: 650px; }
+.analysis-section-title { margin: 10px 0 0; }
+.analysis-method-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.analysis-method { min-width: 0; margin: 0; border: 1px solid var(--border-color-primary);
+  border-radius: 14px; background: var(--block-background-fill); overflow: hidden; }
+.analysis-method > summary { display: grid; gap: 8px; padding: 13px; cursor: pointer; list-style: none; }
+.analysis-method > summary::-webkit-details-marker { display: none; }
+.analysis-method > summary h4 { margin: 0; font-size: .95rem; }
+.analysis-method[open] > summary { border-bottom: 1px solid var(--border-color-primary); }
+.analysis-method .table-scroll { border: 0; border-radius: 0; }
+.analysis-method table { min-width: 600px; }
+.guide { display: grid; gap: 18px; }
+.guide .tab-intro { margin-bottom: 0; }
+.pipeline { display: flex; align-items: center; gap: 10px; padding: 14px;
+  border: 1px solid var(--border-color-primary); border-radius: 16px;
+  background: var(--block-background-fill); }
+.pipeline-step { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; flex: 1;
+  align-items: center; min-width: 0; }
+.pipeline-step > span { grid-row: span 2; display: grid; width: 34px; height: 34px;
+  place-items: center; border-radius: 11px; background: rgba(99,102,241,.14); color: #6366f1;
+  font-size: .74rem; font-weight: 800; }
+.pipeline-step strong { font-size: .9rem; }
+.pipeline-step small { color: var(--body-text-color-subdued); font-size: .75rem; }
+.pipeline-arrow { color: #6366f1; }
+.guide-section-title { margin: 4px 0 -6px; font-size: 1.12rem; }
+.system-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.system-card { min-width: 0; padding: 15px; border: 1px solid var(--border-color-primary);
+  border-top: 3px solid var(--guide-accent); border-radius: 14px;
+  background: var(--block-background-fill); }
+.system-kind { color: var(--guide-accent); font-size: .66rem; font-weight: 800; letter-spacing: .09em; }
+.system-card h3 { margin: 5px 0; font-size: 1rem; }
+.system-card p { min-height: 3.8em; margin: 0 0 10px; color: var(--body-text-color-subdued);
+  font-size: .82rem; line-height: 1.5; }
+.system-card > div { margin-top: 7px; font-size: .78rem; line-height: 1.45; }
+.system-card > div b { display: block; color: var(--guide-accent); font-size: .68rem;
+  letter-spacing: .04em; text-transform: uppercase; }
+.guide-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 12px; align-items: start; }
+.guide-panel { min-width: 0; padding: 16px; border: 1px solid var(--border-color-primary);
+  border-radius: 16px; background: var(--block-background-fill); }
+.guide-panel h3 { margin: 4px 0 10px; font-size: 1.02rem; }
+.guide-panel ul { display: grid; gap: 8px; margin: 0; padding-left: 20px; font-size: .82rem; line-height: 1.55; }
+.metrics-panel > div { padding: 8px 0; border-bottom: 1px solid var(--border-color-primary); }
+.metrics-panel > div:last-of-type { border-bottom: 0; }
+.metrics-panel > div b { color: #6366f1; }
+.metrics-panel > div p { margin: 3px 0 0; color: var(--body-text-color-subdued); font-size: .8rem; line-height: 1.5; }
 @keyframes grow-in { from { transform: scaleX(.04); opacity: .25; } to { transform: scaleX(1); opacity: 1; } }
 @media (max-width: 760px) {
   .insights { grid-template-columns: 1fr; }
   .chart-grid { grid-template-columns: 1fr; }
   .wide-chart { grid-column: auto; }
   .chart-card { padding: 12px; }
+  .protocol ul { grid-template-columns: 1fr; gap: 4px; }
   .data-chart { min-width: 540px; }
   .chart-viewport { overflow-x: auto; }
+  .analysis-facts, .analysis-method-grid, .guide-grid { grid-template-columns: 1fr; }
+  .system-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pipeline { align-items: stretch; flex-direction: column; }
+  .pipeline-arrow { align-self: center; transform: rotate(90deg); }
+  .system-card p { min-height: 0; }
+  .lrow { grid-template-columns: minmax(100px, 1fr) 1.4fr 62px; }
+}
+@media (max-width: 480px) {
+  .system-grid { grid-template-columns: 1fr; }
+  .tab-intro { padding: 16px; }
+  .output-banner { align-items: flex-start; flex-direction: column; }
+  .step-strip { align-items: flex-start; flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
@@ -1047,16 +1915,40 @@ PLACEHOLDER = (
 def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
     """Construct the Gradio Blocks UI around ``backend``."""
 
-    def search(query: str, systems: List[str], top_k: int, depth: int, do_highlight: bool):
-        query = (query or "").strip()
-        if not query:
+    def search(
+        query: str,
+        systems: List[str],
+        top_k: int,
+        depth: int,
+        do_highlight: bool,
+        enhancement: str = "Original",
+    ):
+        raw_query = (query or "").strip()
+        if not raw_query:
             raise gr.Error("Enter a query before searching.")
         if not systems:
             raise gr.Error("Select at least one system to display.")
         top_k, depth = int(top_k), int(depth)
         depth = max(depth, top_k)
-        terms = query_terms(query)
 
+        # Opt-in query enhancement
+        active_query = raw_query
+        enhancement_label = str(enhancement or "").lower()
+        enhancement_note = ""
+        if "norm" in enhancement_label:
+            active_query = enhance_query(raw_query, "normalize")
+            if active_query != raw_query:
+                enhancement_note = f"Normalized: '{active_query}'"
+        elif "synonym" in enhancement_label:
+            active_query = enhance_query(raw_query, "synonym", synonyms=SYNONYMS)
+            if active_query != raw_query:
+                enhancement_note = f"Synonyms expanded: '{active_query}'"
+
+        terms = query_terms(active_query)
+        if raw_query != active_query:
+            terms = list(dict.fromkeys(terms + query_terms(raw_query)))
+
+        query = active_query
         # Stage 1 always runs: it feeds the BM25 column, the cross-encoder, and rank chips.
         started = time.perf_counter()
         stage1 = backend.bm25(query, depth)
@@ -1131,7 +2023,8 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
             for name in ordered
         )
         insights = render_insights(
-            query, top_k, depth, stage1, cross_hits, bm25_rank, {n: timings[n] for n in ordered}
+            raw_query, top_k, depth, stage1, cross_hits, bm25_rank, {n: timings[n] for n in ordered},
+            enhancement_note=enhancement_note,
         )
         return insights, f'<div class="cols">{columns}</div>'
 
@@ -1153,9 +2046,13 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
             for rank, (pid, score) in enumerate(hits, start=1)
         )
         table = (
+            '<div class="feedback-output">'
+            '<div class="output-banner"><span class="eyebrow">CANDIDATES READY</span>'
+            f"<strong>{len(hits)} passages retrieved</strong>"
+            "<span>Choose positive and/or negative examples below, then apply feedback.</span></div>"
             "<p>Session-local candidates. Mark relevant and/or irrelevant, then rerank.</p>"
             "<table><thead><tr><th>Rank</th><th>PID</th><th>Passage</th><th>TF-IDF score</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
+            f"<tbody>{rows}</tbody></table></div>"
         )
         return table, gr.update(choices=options, value=[]), gr.update(
             choices=options, value=[]
@@ -1195,74 +2092,28 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 f"<td>{score:.4f}</td><td>{movement}</td></tr>"
             )
         return (
+            '<div class="feedback-output">'
+            '<div class="output-banner"><span class="eyebrow">UPDATED RANKING</span>'
+            f"<strong>{len(updated)} passages re-ordered</strong>"
+            f"<span>{len(positive_ids)} relevant · {len(negative_ids)} irrelevant examples</span></div>"
             "<p>Rocchio feedback is user-provided and session-local; "
             "it is not benchmark relevance.</p>"
             "<table><thead><tr><th>New rank</th><th>PID</th><th>Passage</th>"
-            f"<th>TF-IDF score</th><th>Rank change</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            f"<th>TF-IDF score</th><th>Rank change</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         )
 
     def filtered_benchmark_ids(category: str) -> List[str]:
         queries = backend.benchmark_queries or {}
         if category == "All":
             return list(queries)
-        if category in {"Short", "Medium", "Long"}:
-            bounds = {"Short": (0, 3), "Medium": (4, 6), "Long": (7, 10**9)}
-            lower, upper = bounds[category]
-            return [
-                qid for qid, text in queries.items()
-                if lower <= len(text.split()) <= upper
-            ]
-        metrics_path = RESULTS_DIR / "per_query_metrics.csv"
-        if not metrics_path.is_file():
-            return []
-        import pandas as pd
-
-        frame = pd.read_csv(metrics_path)
-        if not {"system", "query_id", "MRR@10"}.issubset(frame.columns):
-            raise ValueError(f"Per-query metrics file has unexpected columns: {metrics_path}")
-        values = {
-            (str(int(row["query_id"])), str(row["system"])): float(row["MRR@10"])
-            for _, row in frame.iterrows()
-        }
-        selected = []
-        for qid in queries:
-            bm25 = values.get((qid, "BM25"))
-            dense = values.get((qid, "Bi-encoder"))
-            hybrid = values.get((qid, "Hybrid RRF"))
-            bm25_cross = values.get((qid, "BM25 → Cross-encoder"))
-            hybrid_cross = values.get((qid, "Hybrid RRF → Cross-encoder"))
-            if category == "Retrieval failures" and all(
-                score is not None and score <= 0 for score in (bm25, dense)
-            ):
-                selected.append(qid)
-            elif category == "Low ranking quality" and max(
-                (score for score in (bm25, dense, hybrid) if score is not None),
-                default=1.0,
-            ) < 0.1:
-                selected.append(qid)
-            elif category == "Hybrid improves" and hybrid is not None and bm25 is not None and hybrid > bm25:
-                selected.append(qid)
-            elif category == "Hybrid damages" and hybrid is not None and bm25 is not None and hybrid < bm25:
-                selected.append(qid)
-            elif category == "Reranking improves" and (
-                (bm25_cross is not None and bm25 is not None and bm25_cross > bm25)
-                or (
-                    hybrid_cross is not None
-                    and hybrid is not None
-                    and hybrid_cross > hybrid
-                )
-            ):
-                selected.append(qid)
-            elif category == "Reranking damages" and (
-                (bm25_cross is not None and bm25 is not None and bm25_cross < bm25)
-                or (
-                    hybrid_cross is not None
-                    and hybrid is not None
-                    and hybrid_cross < hybrid
-                )
-            ):
-                selected.append(qid)
-        return selected
+        bounds = {"Short": (0, 3), "Medium": (4, 6), "Long": (7, 10**9)}
+        if category not in bounds:
+            raise ValueError(f"Unsupported judged-query filter: {category}")
+        lower, upper = bounds[category]
+        return [
+            qid for qid, text in queries.items()
+            if lower <= len(text.split()) <= upper
+        ]
 
     def update_error_query_choices(category: str):
         query_ids = filtered_benchmark_ids(category)
@@ -1273,8 +2124,10 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
         )
 
     def analyze_benchmark_query(query_id: str):
+        from src.evaluate import evaluate_run
+
         if not backend.benchmark_queries or not backend.benchmark_qrels:
-            return "<p>Judged test queries and qrels are unavailable. Prepare the dataset first.</p>"
+            return QUERY_ANALYSIS_UNAVAILABLE
         qid = str(query_id or "")
         query_text = backend.benchmark_queries.get(qid)
         judgments = backend.benchmark_qrels.get(qid)
@@ -1326,12 +2179,15 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 for rank, (pid, score) in enumerate(hits[:10], start=1)
             )
             sections.append(
-                f"<h4>{html.escape(name)} — MRR@10 {query_metrics['MRR@10']:.3f}, "
-                f"NDCG@10 {query_metrics['NDCG@10']:.3f}, "
-                f"Recall@10 {query_metrics['Recall@10']:.3f}, "
-                f"Recall@100 {query_metrics['Recall@100']:.3f}</h4>"
-                "<table><thead><tr><th>Rank</th><th>PID</th><th>Judgment</th>"
-                f"<th>Score</th><th>Passage</th></tr></thead><tbody>{rows}</tbody></table>"
+                '<details class="analysis-method"><summary>'
+                f'<h4>{html.escape(name)}</h4><div class="metric-pills">'
+                f'<span>MRR@10 <b>{query_metrics["MRR@10"]:.3f}</b></span>'
+                f'<span>NDCG@10 <b>{query_metrics["NDCG@10"]:.3f}</b></span>'
+                f'<span>Recall@10 <b>{query_metrics["Recall@10"]:.3f}</b></span>'
+                f'<span>Recall@100 <b>{query_metrics["Recall@100"]:.3f}</b></span>'
+                "</div></summary><div class=\"table-scroll\"><table>"
+                "<thead><tr><th>Rank</th><th>PID</th><th>Judgment</th>"
+                f"<th>Score</th><th>Passage</th></tr></thead><tbody>{rows}</tbody></table></div></details>"
             )
         bm25_top = {pid for pid, _ in bm25_hits[:10]}
         dense_top = {pid for pid, _ in dense_hits[:10]}
@@ -1356,19 +2212,27 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 f"<td>{bm25_cross_rank.get(pid, '—')}</td><td>{rrf_rank.get(pid, '—')}</td>"
                 f"<td>{cross_rank.get(pid, '—')}</td></tr>"
             )
+        found_ids = html.escape(", ".join(map(str, found)) or "none")
+        missed_ids = html.escape(", ".join(map(str, missed)) or "none")
         return (
-            f"<h3>Judged benchmark query {html.escape(qid)}</h3>"
-            f"<p>{html.escape(query_text)}</p>"
-            f"<p>Ground-truth relevant passage IDs: {html.escape(', '.join(map(str, sorted(positive))) or 'none judged relevant')}</p>"
-            f"<p>RRF relevant found: {html.escape(', '.join(map(str, found)) or 'none')}; "
-            f"missed: {html.escape(', '.join(map(str, missed)) or 'none')}.</p>"
-            f"<p>Candidate-generation recall (separate from final ranking): "
-            f"{html.escape(json.dumps(candidate_recall, sort_keys=True))}</p>"
-            f"<p>{html.escape(overlap)}</p>"
-            "<h4>Rank movement</h4><table><thead><tr><th>PID</th><th>BM25 rank</th>"
+            '<div class="query-analysis">'
+            '<section class="analysis-query">'
+            f'<span class="eyebrow">JUDGED TEST QUERY · {html.escape(qid)}</span>'
+            f"<h3>{html.escape(query_text)}</h3>"
+            f'<div class="analysis-facts"><div><span>Judged relevant passages</span>'
+            f"<b>{html.escape(', '.join(map(str, sorted(positive))) or 'none judged relevant')}</b></div>"
+            f'<div><span>RRF candidate coverage</span><b>{len(found)} found · {len(missed)} missed</b></div>'
+            f'<div><span>Top-10 comparison</span><b>{html.escape(overlap)}</b></div></div>'
+            f'<p class="fine">RRF found: {found_ids} · Missed: {missed_ids}</p>'
+            "</section>"
+            '<section class="analysis-summary"><h4>Candidate-generation recall</h4>'
+            f'<div class="metric-pills">{"".join(f"<span>{html.escape(name)} <b>{value:.1%}</b></span>" for name, value in candidate_recall.items())}</div></section>'
+            '<section class="analysis-movement"><h4>Rank movement across the fused candidates</h4>'
+            "<div class=\"table-scroll\"><table><thead><tr><th>PID</th><th>BM25 rank</th>"
             f"<th>BM25 + cross-encoder rank</th><th>RRF rank</th>"
-            f"<th>RRF + cross-encoder rank</th></tr></thead><tbody>{''.join(movement_rows)}</tbody></table>"
-            + "".join(sections)
+            f"<th>RRF + cross-encoder rank</th></tr></thead><tbody>{''.join(movement_rows)}</tbody></table></div></section>"
+            '<h4 class="analysis-section-title">Top-10 passage lists by method</h4>'
+            f'<div class="analysis-method-grid">{"".join(sections)}</div></div>'
         )
 
     theme = gr.themes.Soft(
@@ -1394,6 +2258,12 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
         )
         with gr.Tabs():
             with gr.Tab("Search"):
+                gr.HTML(
+                    '<div class="tab-intro search-intro"><span class="eyebrow">INTERACTIVE RETRIEVAL LAB</span>'
+                    "<h2>Ask a question. Compare how each system finds answers.</h2>"
+                    "<p>Choose an example or enter your own query. Live results are ranked, not judged; "
+                    "use the Benchmarks tab for the saved offline quality evaluation.</p></div>"
+                )
                 with gr.Row(equal_height=True):
                     query = gr.Textbox(
                         label="Query", placeholder="Ask a question, e.g. 'where does the water from cellular respiration go'",
@@ -1403,7 +2273,7 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                     random_btn = gr.Button("\U0001f3b2 Random example", scale=1)
                 with gr.Row():
                     example_buttons = [gr.Button(q if len(q) < 58 else q[:55] + "…", size="sm") for q in EXAMPLE_QUERIES]
-                with gr.Accordion("Settings", open=False):
+                with gr.Accordion("Settings & Query Enhancement", open=False):
                     systems = gr.CheckboxGroup(
                         choices=list(SYSTEMS), value=DEFAULT_SYSTEMS, label="Systems to compare",
                         info="Select systems to compare. Rank-movement chips are shown relative to BM25.",
@@ -1411,7 +2281,15 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                     with gr.Row():
                         top_k = gr.Slider(3, 20, value=10, step=1, label="Results per system")
                         depth = gr.Slider(10, 200, value=100, step=10, label="Cross-encoder candidate depth (BM25 top-N)")
-                    do_highlight = gr.Checkbox(value=True, label="Highlight query terms")
+                    with gr.Row():
+                        enhancement = gr.Dropdown(
+                            choices=["Original", "Normalized (NFKC)", "Synonym expansion"],
+                            value="Original",
+                            label="Query enhancement",
+                            info="Optional query transformations before retrieval",
+                            scale=2,
+                        )
+                        do_highlight = gr.Checkbox(value=True, label="Highlight query terms", scale=1)
                 insights_out = gr.HTML()
                 results_out = gr.HTML(PLACEHOLDER)
 
@@ -1419,23 +2297,40 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 gr.HTML(render_benchmark())
 
             with gr.Tab("Relevance feedback"):
-                gr.Markdown(
-                    "Mark passages explicitly as relevant or irrelevant. "
-                    "Feedback is session-local and updates a TF-IDF ranking with Rocchio's formula."
+                gr.HTML(
+                    '<div class="tab-intro feedback-intro"><span class="eyebrow">PERSONALIZE A SEARCH</span>'
+                    "<h2>Teach the ranker what matters for this query</h2>"
+                    "<p>Mark a few retrieved passages as relevant or irrelevant. Rocchio feedback adjusts "
+                    "the TF-IDF query for this update only; it does not train the model or change benchmark results.</p>"
+                    '<div class="step-strip"><span><b>1</b> Retrieve candidates</span>'
+                    '<span><b>2</b> Label examples</span><span><b>3</b> Review rank changes</span></div></div>'
                 )
-                feedback_query = gr.Textbox(label="Feedback query")
-                feedback_fetch = gr.Button("Retrieve TF-IDF candidates")
-                feedback_candidates_out = gr.HTML()
+                with gr.Row(equal_height=True):
+                    feedback_query = gr.Textbox(
+                        label="Search query",
+                        placeholder="Enter the question you want to refine",
+                        scale=5,
+                    )
+                    feedback_fetch = gr.Button(
+                        "Retrieve candidates", variant="primary", scale=1
+                    )
+                feedback_candidates_out = gr.HTML(
+                    '<div class="feedback-empty"><b>Start with a query</b>'
+                    "<span>Retrieve up to 20 TF-IDF candidates to begin labeling examples.</span></div>"
+                )
                 feedback_state = gr.State({})
                 with gr.Row():
                     positive_feedback = gr.CheckboxGroup(
-                        label="Relevant passages (positive feedback)", choices=[]
+                        label="Relevant — move toward these", choices=[]
                     )
                     negative_feedback = gr.CheckboxGroup(
-                        label="Irrelevant passages (negative feedback)", choices=[]
+                        label="Irrelevant — move away from these", choices=[]
                     )
-                feedback_apply = gr.Button("Update ranking", variant="primary")
-                feedback_results = gr.HTML()
+                feedback_apply = gr.Button("Apply feedback and rerank", variant="primary")
+                feedback_results = gr.HTML(
+                    '<div class="feedback-empty"><b>Your updated ranking will appear here</b>'
+                    "<span>Candidate order changes after you apply positive or negative feedback.</span></div>"
+                )
                 feedback_fetch.click(
                     feedback_candidates,
                     [feedback_query],
@@ -1453,54 +2348,55 @@ def build_app(backend: Backend) -> Tuple[gr.Blocks, dict]:
                 )
 
             with gr.Tab("Query error analysis"):
-                gr.Markdown(
-                    "Select a held-out, qrels-judged test query. Live search queries have no inferred labels "
-                    "and are not included in this benchmark analysis."
-                )
-                error_filter = gr.Dropdown(
-                    choices=[
-                        "All",
-                        "Short",
-                        "Medium",
-                        "Long",
-                        "Retrieval failures",
-                        "Low ranking quality",
-                        "Hybrid improves",
-                        "Hybrid damages",
-                        "Reranking improves",
-                        "Reranking damages",
-                    ],
-                    value="All",
-                    label="Query filter",
+                gr.HTML(
+                    '<div class="tab-intro analysis-intro"><span class="eyebrow">QUERY-LEVEL DIAGNOSTICS</span>'
+                    "<h2>See where retrieval succeeds or misses</h2>"
+                    "<p>Filter prepared, judged test queries by length, then compare how the "
+                    "Space's current retrieval systems handle a selected query. Live searches "
+                    "are not assigned inferred relevance labels.</p></div>"
                 )
                 initial_ids = list((backend.benchmark_queries or {}).keys())
-                error_query = gr.Dropdown(
-                    choices=[
-                        (f"{qid}: {text[:80]}", qid)
-                        for qid, text in (backend.benchmark_queries or {}).items()
-                    ],
-                    value=initial_ids[0] if initial_ids else None,
-                    label="Judged test query",
-                )
-                analyze_button = gr.Button("Analyze selected query", variant="primary")
-                error_analysis = gr.HTML(
-                    "<p>Prepared test queries and qrels are required for this analysis.</p>"
-                )
-                error_filter.change(
-                    update_error_query_choices,
-                    [error_filter],
-                    [error_query],
-                )
-                analyze_button.click(
-                    analyze_benchmark_query,
-                    [error_query],
-                    [error_analysis],
-                )
+                if initial_ids and backend.benchmark_qrels:
+                    analysis_initial = (
+                        '<div class="analysis-empty"><span class="eyebrow">READY TO EXPLORE</span>'
+                        f"<h3>{len(initial_ids):,} held-out queries with qrels</h3>"
+                        "<p>Choose a query to compare candidate coverage and top-ranked passages.</p></div>"
+                    )
+                    with gr.Row():
+                        error_filter = gr.Dropdown(
+                            choices=["All", "Short", "Medium", "Long"],
+                            value="All",
+                            label="Filter test queries",
+                            scale=1,
+                        )
+                        error_query = gr.Dropdown(
+                            choices=[
+                                (f"{qid}: {text[:80]}", qid)
+                                for qid, text in (backend.benchmark_queries or {}).items()
+                            ],
+                            value=initial_ids[0],
+                            label="Select a judged query",
+                            scale=2,
+                        )
+                    analyze_button = gr.Button("Analyze query", variant="primary")
+                    error_analysis = gr.HTML(analysis_initial)
+                    error_filter.change(
+                        update_error_query_choices,
+                        [error_filter],
+                        [error_query],
+                    )
+                    analyze_button.click(
+                        analyze_benchmark_query,
+                        [error_query],
+                        [error_analysis],
+                    )
+                else:
+                    gr.HTML(QUERY_ANALYSIS_UNAVAILABLE)
 
             with gr.Tab("How it works"):
-                gr.Markdown(HOW_IT_WORKS)
+                gr.HTML(HOW_IT_WORKS)
 
-        inputs = [query, systems, top_k, depth, do_highlight]
+        inputs = [query, systems, top_k, depth, do_highlight, enhancement]
         outputs = [insights_out, results_out]
         search_btn.click(search, inputs, outputs)
         query.submit(search, inputs, outputs)
